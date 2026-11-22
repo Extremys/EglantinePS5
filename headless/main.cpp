@@ -1268,6 +1268,29 @@ int main(int argc, char** argv) {
             // Speed against accuracy ("performance" in the settings file, settings_store.h): each
             // one is off unless chosen there, for every game or for this one. The levels start
             // every session at their exact values (above), so one that is not chosen is off.
+            // Ocarina of Time: native task/mesh draws end the process without a signal ~2 s after
+            // its opening movie (the first scene's first mesh draws) on the pinned RADV; the
+            // compute fallback draws the same geometry and the game plays on. Measured with
+            // autoboot.txt + a replayed controller: native died in 5 of 5 runs, the fallback and
+            // EDEN_NX2_NO_MESH ran on. EDEN_NX2_FORCE_MESH_FALLBACK=0 in env.txt keeps native.
+            {
+                static bool fallback_ours = false;
+                static const bool native_asked = [] {
+                    const char* value = std::getenv("EDEN_NX2_FORCE_MESH_FALLBACK");
+                    return value && value[0] == '0';
+                }();
+                const char* forced = std::getenv("EDEN_NX2_FORCE_MESH_FALLBACK");
+                if (native_asked) {
+                    unsetenv("EDEN_NX2_FORCE_MESH_FALLBACK");
+                } else if (eden_game_title_id(guest) == 0x0400486024DEC000ULL && !forced) {
+                    setenv("EDEN_NX2_FORCE_MESH_FALLBACK", "1", 1);
+                    fallback_ours = true;
+                    Eden::Report("launch", "Ocarina of Time: task/mesh draws take the compute fallback");
+                } else if (fallback_ours && eden_game_title_id(guest) != 0x0400486024DEC000ULL) {
+                    unsetenv("EDEN_NX2_FORCE_MESH_FALLBACK");
+                    fallback_ours = false;
+                }
+            }
             const auto speed = Eden::LoadPerformance(eden_game_title_id(guest));
             Settings::values.use_asynchronous_shaders = speed.async_shaders;
             if (speed.fast_gpu) {
