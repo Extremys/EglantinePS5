@@ -145,13 +145,12 @@ bool PackEnabled() noexcept; // packing (below)
 bool PoolShortForPacking() noexcept;
 // The reserve kept, in blocks: EDEN_CRAM_RESERVE_MIB (up to 512), else 128 MiB while packing runs
 // (packing gives blocks back when the pool is short; MKW used none of the 512 MiB), else 512 MiB.
+// Read each time: a game's own default is set when it launches (headless/main.cpp), after the
+// service has started for the first guest range.
 std::size_t ReserveTarget() noexcept {
-    static const std::size_t blocks = [] {
-        const char* value = std::getenv("EDEN_CRAM_RESERVE_MIB");
-        const std::size_t mib = value != nullptr ? std::strtoull(value, nullptr, 10) : PackEnabled() ? 128 : 512;
-        return std::max<std::size_t>(1, std::min(ReserveBlocks, mib / (SparseSlot >> 20)));
-    }();
-    return blocks;
+    const char* value = std::getenv("EDEN_CRAM_RESERVE_MIB");
+    const std::size_t mib = value != nullptr ? std::strtoull(value, nullptr, 10) : PackEnabled() ? 128 : 512;
+    return std::max<std::size_t>(1, std::min(ReserveBlocks, mib / (SparseSlot >> 20)));
 }
 std::atomic<std::size_t> reserve_count{0};
 std::atomic_flag reserve_lock = ATOMIC_FLAG_INIT;
@@ -466,7 +465,18 @@ std::atomic<std::uint64_t> unit_live{0}; // pieces handed out
 // Units packed into the store (a Sub slot's cold units): how many now, their packed bytes, and the
 // packs, unpacks, skips (would not compress) and moves (pieces moved out of sparse blocks) so far.
 std::atomic<std::uint64_t> units_packed{0}, units_packed_bytes{0}, unit_packs{0}, unit_unpacks{0}, unit_pack_skips{0},
-    unit_moves{0}, sub_splits{0};
+    unit_moves{0}, sub_splits{0}, unit_probes{0}, unit_probe_hits{0}, unit_came_back{0};
+// The pool was short at the start of this scan pass (ScanPass; one system call a pass, not one a slot).
+std::atomic<bool> pool_short_pass{false};
+// Packing before the pool is short: units unwritten and untouched for this long (EDEN_CRAM_UNIT_PACK_EARLY_S,
+// default 120; 0: only once the pool is short).
+std::size_t UnitPackEarlySeconds() noexcept {
+    static const std::size_t seconds = [] {
+        const char* value = std::getenv("EDEN_CRAM_UNIT_PACK_EARLY_S");
+        return value != nullptr && *value ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : std::size_t{120};
+    }();
+    return seconds;
+}
 // Packing a Sub slot's cold units (EDEN_CRAM_UNIT_PACK=0 turns it off), and how well a unit must
 // compress (EDEN_CRAM_UNIT_PACK_RATIO, percent, default 85).
 bool UnitPackEnabled() noexcept {
@@ -642,6 +652,7 @@ bool RemapSubUnit(SparseRange& range, std::size_t slot, std::size_t unit, std::u
     const std::uint32_t was = codes[unit];
     codes[unit] = code;
     sub_remaps.fetch_add(1, std::memory_order_relaxed);
+    range.sub_probe[slot] = 0; // (every backed unit is read-write again)
     if (MapSub(SlotAddress(range, slot), codes, packed)) return true;
     codes[unit] = was;
     if (!MapSub(SlotAddress(range, slot), codes, range.sub_packed[slot])) std::abort(); // its data must stay reachable
@@ -700,6 +711,7 @@ bool PromoteZeroSub(SparseRange& range, std::size_t slot, std::size_t unit) noex
     }
     range.sub[slot] = 1u << unit;
     range.sub_packed[slot] = 0;
+    range.sub_probe[slot] = 0;
     range.sub_unit[slot * SubUnits + unit] = codes[unit];
     range.physical[slot] = -1;
     sub_made.fetch_add(1, std::memory_order_relaxed);
@@ -713,7 +725,16 @@ bool PromoteZeroSub(SparseRange& range, std::size_t slot, std::size_t unit) noex
 // nothing to do.
 bool BackSubUnit(SparseRange& range, std::size_t slot, std::size_t unit) noexcept {
 #ifdef PS5_NATIVE
-    if (range.sub[slot] & (1u << unit)) return true;
+    if (range.sub[slot] & (1u << unit)) {
+        // On probation (no access, to see whether it is touched): read-write again, nothing lost.
+        if (range.sub_probe[slot] & (1u << unit)) {
+            if (mprotect(reinterpret_cast<void*>(SlotAddress(range, slot) + unit * SubUnit), SubUnit, PROT_READ | PROT_WRITE) != 0)
+                std::abort();
+            range.sub_probe[slot] &= ~(1u << unit);
+            unit_probe_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
     if (range.sub_packed[slot] & (1u << unit)) return UnpackUnit(range, slot, unit);
     std::uint32_t code = 0;
     if (!UnitTake(&code, UnitOwner(range, slot, unit))) return false;
@@ -747,6 +768,7 @@ void GiveSubUnit(SparseRange& range, std::size_t slot, std::size_t unit) noexcep
         UnitGive(std::exchange(range.sub_unit[slot * SubUnits + unit], 0u));
         range.sub[slot] &= ~(1u << unit);
     }
+    range.sub_probe[slot] &= ~(1u << unit);
     sub_given.fetch_add(1, std::memory_order_relaxed);
 #else
     (void)range, (void)slot, (void)unit;
@@ -761,6 +783,7 @@ void ReturnSub(SparseRange& range, std::size_t slot) noexcept {
         if (range.sub_packed[slot] & (1u << unit)) ForgetPackedUnit(range, slot, unit);
     }
     range.sub_packed[slot] = 0;
+    range.sub_probe[slot] = 0;
 #endif
     range.sub[slot] = 0;
     range.physical[slot] = -1;
@@ -789,12 +812,14 @@ bool PromoteSub(SparseRange& range, std::size_t slot) noexcept {
             if ((range.sub[slot] & (1u << unit)) &&
                 mprotect(reinterpret_cast<void*>(at + unit * SubUnit), SubUnit, PROT_READ | PROT_WRITE) != 0)
                 std::abort();
+        range.sub_probe[slot] = 0;
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
     }
     for (std::size_t unit = 0; unit < SubUnits; ++unit)
         if (range.sub[slot] & (1u << unit)) UnitGive(std::exchange(range.sub_unit[slot * SubUnits + unit], 0u));
     range.sub[slot] = 0;
+    range.sub_probe[slot] = 0;
     range.physical[slot] = physical;
     guest_committed.fetch_add(SparseSlot, std::memory_order_relaxed);
     sub_whole.fetch_add(1, std::memory_order_relaxed);
@@ -1317,7 +1342,7 @@ bool HandleGuestWriteFault(void* fault) noexcept {
     const std::size_t unit = (address - SlotAddress(*range, slot)) % SparseSlot / SubUnit;
     const bool sub = range->sub != nullptr && (state == SlotSub || (state == SlotZero && SubEnabled()));
     // A write fault on a unit that is backed and writable has nothing to change (counted as a repeat).
-    const bool unchanged = state == SlotSub && (range->sub[slot] & (1u << unit));
+    const bool unchanged = state == SlotSub && (range->sub[slot] & ~range->sub_probe[slot] & (1u << unit));
     const auto promote = [&]() noexcept {
         bool done = true;
         if (state == SlotSub) {
@@ -1427,7 +1452,10 @@ bool AddStates(SparseRange& range) noexcept {
         range.sub_packed = range.sub_unit ? new (std::nothrow) std::uint32_t[slots]() : nullptr;
         range.unit_pack_at = range.sub_packed ? new (std::nothrow) std::uint32_t[slots * SubUnits]() : nullptr;
         range.unit_pack_size = range.unit_pack_at ? new (std::nothrow) std::uint16_t[slots * SubUnits]() : nullptr;
-        if (range.unit_pack_size == nullptr) {
+        range.sub_probe = range.unit_pack_size ? new (std::nothrow) std::uint32_t[slots]() : nullptr;
+        if (range.sub_probe == nullptr) {
+            delete[] range.unit_pack_size;
+            range.unit_pack_size = nullptr;
             delete[] range.sub;
             delete[] range.sub_unit;
             delete[] range.sub_packed;
@@ -1601,6 +1629,7 @@ bool ScanSub(SparseRange& range, std::size_t slot, std::size_t min_zero = SubMin
     range.physical[slot] = -1;
     range.sub[slot] = mask;
     range.sub_packed[slot] = 0;
+    range.sub_probe[slot] = 0;
     for (std::size_t unit = 0; unit < SubUnits; ++unit) range.sub_unit[slot * SubUnits + unit] = codes[unit];
     (min_zero != 0 ? sub_from_own : sub_splits).fetch_add(1, std::memory_order_relaxed);
     UnlockSlot(range, slot, SlotSub);
@@ -1616,14 +1645,14 @@ bool ScanSub(SparseRange& range, std::size_t slot, std::size_t min_zero = SubMin
 void ScanSubSlot(SparseRange& range, std::size_t slot) noexcept {
 #ifdef PS5_NATIVE
     const std::uintptr_t at = SlotAddress(range, slot);
-    const std::uint32_t seen = range.sub[slot]; // racy: a hint
+    const std::uint32_t seen = range.sub[slot] & ~range.sub_probe[slot]; // racy: a hint (probed units read would fault)
     std::uint32_t zero = 0;
     for (std::size_t unit = 0; unit < SubUnits; ++unit)
         if ((seen & (1u << unit)) && UnitZero(at + unit * SubUnit)) zero |= 1u << unit;
     // Not made whole while it has packed units, or while packing has a short pool to answer (a slot
     // split for packing would be made whole again before its units are cold).
     const bool whole = static_cast<std::size_t>(__builtin_popcount(seen)) >= SubWholeUnits() && range.sub_packed[slot] == 0 &&
-                       counters.passes.load(std::memory_order_relaxed) >= range.fine_after[slot] && !PoolShortForPacking();
+                       counters.passes.load(std::memory_order_relaxed) >= range.fine_after[slot] && !pool_short_pass.load(std::memory_order_relaxed);
     if (zero == 0 && !whole) return;
     LockSlot(range, slot);
     if (SlotState(range, slot) != SlotSub) {
@@ -1632,7 +1661,7 @@ void ScanSubSlot(SparseRange& range, std::size_t slot) noexcept {
     }
     DropSlotAliases(range, slot);
     for (std::size_t unit = 0; unit < SubUnits; ++unit) {
-        if (!(zero & range.sub[slot] & (1u << unit))) continue;
+        if (!(zero & range.sub[slot] & ~range.sub_probe[slot] & (1u << unit))) continue;
         const std::uintptr_t unit_at = at + unit * SubUnit;
         if (mprotect(reinterpret_cast<void*>(unit_at), SubUnit, PROT_READ) != 0) std::abort();
         if (UnitZero(unit_at)) GiveSubUnit(range, slot, unit);
@@ -1728,8 +1757,7 @@ std::size_t EnvOr(const char* name, std::size_t fallback) noexcept {
     return value != nullptr && *value ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : fallback;
 }
 std::size_t PackBelowLargest() noexcept {
-    static const std::size_t bytes = EnvOr("EDEN_CRAM_PACK_BELOW_MIB", 3072) << 20;
-    return bytes;
+    return EnvOr("EDEN_CRAM_PACK_BELOW_MIB", 3072) << 20; // (read each time, as ReserveTarget)
 }
 constexpr double PackMaxRatio = 0.6;
 std::vector<std::uint8_t> pack_times; // per slot, the scanner's: how often it was packed
@@ -1949,7 +1977,9 @@ void ReportUnpackers() noexcept {
 // Own slot that does not pack whole is made Sub first (split), so that its units can pack one by one.
 std::vector<std::uint64_t> unit_cold_hash;
 std::vector<std::uint32_t> unit_cold_since;
-std::vector<std::uint8_t> unit_pack_times;
+std::vector<std::uint8_t> unit_pack_times; // how often it came back (touched on probation, or unpacked)
+std::vector<std::uint8_t> unit_mark;       // what the scanner did last: 1 put it on probation, 2 packed it
+constexpr unsigned UnitBackoffMax = 6;     // ColdSeconds << 6: 32 minutes
 std::vector<std::uint32_t> unit_ready; // slot * 32 + unit, room made once
 constexpr std::size_t UnitPackPerPass = 8192;  // 512 MiB of units
 constexpr std::size_t SplitPerPass = 256;      // 512 MiB of slots
@@ -1960,15 +1990,30 @@ std::uint64_t UnitHash(std::uintptr_t at) noexcept {
     for (std::size_t i = 0; i < SubUnit / 8; i += 64) hash = Mix(hash, word[i]);
     return hash | 1; // (0: not hashed yet)
 }
-// The scanner (pack_mutex held: nothing packs meanwhile, so its backed units stay mapped).
+// The scanner (pack_mutex held: nothing packs meanwhile, so its backed units stay mapped). A unit the
+// scanner put on probation that is read-write again, or packed and backed again, came back: it waits
+// twice as long before it is tried again. Units on probation are not read (that would end it).
 void NoteUnitsCold(SparseRange& range, std::size_t slot, std::uint32_t now) noexcept {
     if (unit_cold_hash.empty()) return;
     const std::uint32_t backed = __atomic_load_n(&range.sub[slot], __ATOMIC_ACQUIRE);
+    const std::uint32_t probed = __atomic_load_n(&range.sub_probe[slot], __ATOMIC_ACQUIRE);
+    const std::uint32_t packed = __atomic_load_n(&range.sub_packed[slot], __ATOMIC_ACQUIRE);
     for (std::size_t unit = 0; unit < SubUnits; ++unit) {
         const std::size_t index = slot * SubUnits + unit;
+        if (packed & (1u << unit)) continue;
         if (!(backed & (1u << unit))) {
             unit_cold_hash[index] = 0;
             unit_cold_since[index] = now;
+            unit_mark[index] = 0;
+            continue;
+        }
+        if (probed & (1u << unit)) continue;
+        if (unit_mark[index] != 0) {
+            unit_mark[index] = 0;
+            if (unit_pack_times[index] < UnitBackoffMax) ++unit_pack_times[index];
+            unit_came_back.fetch_add(1, std::memory_order_relaxed);
+            unit_cold_since[index] = now;
+            unit_cold_hash[index] = UnitHash(SlotAddress(range, slot) + unit * SubUnit);
             continue;
         }
         const std::uint64_t hash = UnitHash(SlotAddress(range, slot) + unit * SubUnit);
@@ -2000,9 +2045,11 @@ bool PackUnit(SparseRange& range, std::size_t slot, std::size_t unit) noexcept {
     }
     const std::size_t index = slot * SubUnits + unit;
     const std::uintptr_t at = SlotAddress(range, slot) + unit * SubUnit;
-    if (mprotect(reinterpret_cast<void*>(at), SubUnit, PROT_READ) != 0) std::abort(); // fenced
-    const int size = LZ4_compress_default(reinterpret_cast<const char*>(at), pack_scratch.data(), static_cast<int>(SubUnit),
-                                          static_cast<int>(pack_scratch.size()));
+    // On probation it is no-access already (and untouched); else fenced while it is compressed.
+    const bool probed = range.sub_probe[slot] & (1u << unit);
+    if (!probed && mprotect(reinterpret_cast<void*>(at), SubUnit, PROT_READ) != 0) std::abort();
+    const int size = LZ4_compress_default(reinterpret_cast<const char*>(UnitView(range.sub_unit[index])), pack_scratch.data(),
+                                          static_cast<int>(SubUnit), static_cast<int>(pack_scratch.size()));
     void* data = size > 0 && static_cast<std::size_t>(size) <= UnitPackMaxBytes() && StoreStart()
                      ? StoreAlloc(static_cast<std::size_t>(size), nullptr) : nullptr;
     if (data != nullptr) {
@@ -2016,13 +2063,16 @@ bool PackUnit(SparseRange& range, std::size_t slot, std::size_t unit) noexcept {
         }
     }
     if (data == nullptr) {
+        // As it was before probation (RemapSubUnit may have mapped it read-write already).
         if (mprotect(reinterpret_cast<void*>(at), SubUnit, PROT_READ | PROT_WRITE) != 0) std::abort();
+        range.sub_probe[slot] &= ~(1u << unit);
         UnlockSlot(range, slot, SlotSub);
         unit_pack_skips.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     UnitGive(std::exchange(range.sub_unit[index], 0u));
     range.sub[slot] &= ~(1u << unit);
+    range.sub_probe[slot] &= ~(1u << unit);
     range.sub_packed[slot] |= 1u << unit;
     range.unit_pack_at[index] = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(data) - store_base + 1);
     range.unit_pack_size[index] = static_cast<std::uint16_t>(size);
@@ -2052,26 +2102,63 @@ void SplitColdSlots(SparseRange& range, const std::vector<std::size_t>& candidat
         }
     }
 }
-void UnitPackPass(SparseRange& range, std::size_t slots, std::uint32_t now) noexcept {
+// Puts a cold unit on probation: no access, its piece kept (the slot is not locked).
+bool ProbeUnit(SparseRange& range, std::size_t slot, std::size_t unit) noexcept {
+    if (GpuKeepsSlot(slot)) return false;
+    LockSlot(range, slot);
+    const bool ok = SlotState(range, slot) == SlotSub && (range.sub[slot] & ~range.sub_probe[slot] & (1u << unit));
+    if (ok) {
+        if (mprotect(reinterpret_cast<void*>(SlotAddress(range, slot) + unit * SubUnit), SubUnit, PROT_NONE) != 0) std::abort();
+        range.sub_probe[slot] |= 1u << unit;
+    }
+    UnlockSlot(range, slot, SlotState(range, slot));
+    return ok;
+}
+// Units on probation since the last pass and untouched are packed (unwritten and unread for a pass:
+// 5 s while the pool is short, 20 s otherwise); then units unwritten for long enough go on probation.
+// Before the pool is short (`short_pool` false) only units unwritten for UnitPackEarlySeconds.
+void UnitPackPass(SparseRange& range, std::size_t slots, std::uint32_t now, bool short_pool) noexcept {
+    std::size_t packed = 0;
+    for (std::size_t slot = 0; slot < slots && packed < UnitPackPerPass; ++slot) {
+        if (SlotState(range, slot) != SlotSub) continue;
+        const std::uint32_t probed = range.sub_probe[slot];
+        for (std::size_t unit = 0; unit < SubUnits && probed != 0; ++unit) {
+            const std::size_t index = slot * SubUnits + unit;
+            if (!(probed & (1u << unit)) || unit_mark[index] != 1) continue;
+            if (PackUnit(range, slot, unit)) {
+                unit_mark[index] = 2;
+                ++packed;
+            } else {
+                unit_mark[index] = 0; // would not pack: it waits its back-off, as a unit that came back
+                if (unit_pack_times[index] < UnitBackoffMax) ++unit_pack_times[index];
+                unit_cold_since[index] = now;
+            }
+        }
+    }
+    const std::uint32_t cold = short_pool ? static_cast<std::uint32_t>(ColdSeconds) : static_cast<std::uint32_t>(UnitPackEarlySeconds());
+    if (cold == 0) return;
     std::vector<std::uint32_t>& ready = unit_ready;
     ready.clear();
     for (std::size_t slot = 0; slot < slots; ++slot) {
         if (SlotState(range, slot) != SlotSub) continue;
-        const std::uint32_t backed = range.sub[slot];
+        const std::uint32_t candidates = range.sub[slot] & ~range.sub_probe[slot];
         for (std::size_t unit = 0; unit < SubUnits; ++unit) {
             const std::size_t index = slot * SubUnits + unit;
-            if ((backed & (1u << unit)) && unit_cold_hash[index] != 0 &&
-                now - unit_cold_since[index] >= (ColdSeconds << std::min<unsigned>(unit_pack_times[index], 4)))
+            if ((candidates & (1u << unit)) && unit_cold_hash[index] != 0 && unit_mark[index] == 0 &&
+                now - unit_cold_since[index] >= (cold << unit_pack_times[index]))
                 ready.push_back(static_cast<std::uint32_t>(index));
         }
     }
     std::sort(ready.begin(), ready.end(), [](std::uint32_t a, std::uint32_t b) { return unit_cold_since[a] < unit_cold_since[b]; });
-    std::size_t done = 0;
+    const std::size_t limit = short_pool ? UnitPackPerPass : UnitPackPerPass / 4;
+    std::size_t probed = 0;
     for (const std::uint32_t index : ready) {
-        if (done >= UnitPackPerPass) break;
-        if (unit_pack_times[index] < 255) ++unit_pack_times[index];
-        if (PackUnit(range, index / SubUnits, index % SubUnits)) ++done;
-        unit_cold_since[index] = now; // packed, or would not: waits its back-off
+        if (probed >= limit) break;
+        if (ProbeUnit(range, index / SubUnits, index % SubUnits)) {
+            unit_mark[index] = 1;
+            ++probed;
+            unit_probes.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -2083,7 +2170,9 @@ void UnitPackPass(SparseRange& range, std::size_t slots, std::uint32_t now) noex
 void MovePiece(SparseRange& range, std::size_t slot, std::size_t unit, std::uint32_t code) noexcept {
     LockSlot(range, slot);
     const std::size_t index = slot * SubUnits + unit;
-    if (SlotState(range, slot) != SlotSub || !(range.sub[slot] & (1u << unit)) || range.sub_unit[index] != code) {
+    // (a unit on probation stays where it is: moving it would end the probation)
+    if (SlotState(range, slot) != SlotSub || !(range.sub[slot] & ~range.sub_probe[slot] & (1u << unit)) ||
+        range.sub_unit[index] != code) {
         UnlockSlot(range, slot, SlotState(range, slot));
         return;
     }
@@ -2095,6 +2184,7 @@ void MovePiece(SparseRange& range, std::size_t slot, std::size_t unit, std::uint
         if (MapUnits(at, SubUnit, PROT_READ | PROT_WRITE, UnitPhysical(moved)) ||
             RemapSubUnit(range, slot, unit, moved, range.sub_packed[slot])) {
             range.sub_unit[index] = moved;
+            range.sub_probe[slot] &= ~(1u << unit); // (mapped read-write)
             UnitGive(code);
             unit_moves.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -2167,6 +2257,7 @@ void ColdPass(SparseRange& range, std::size_t slots) noexcept {
         unit_cold_hash.assign(slots * SubUnits, 0);
         unit_cold_since.assign(slots * SubUnits, now);
         unit_pack_times.assign(slots * SubUnits, 0);
+        unit_mark.assign(slots * SubUnits, 0);
         unit_ready.reserve(slots * SubUnits);
     }
     for (std::size_t slot = 0; slot < slots; ++slot) {
@@ -2250,7 +2341,11 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
         recover_order.reserve(slots);
         pack_scratch.resize(static_cast<std::size_t>(LZ4_compressBound(static_cast<int>(SparseSlot))));
     }
-    if (pack_refused.load(std::memory_order_relaxed) || !PoolShortForPacking()) return;
+    if (pack_refused.load(std::memory_order_relaxed)) return;
+    if (!PoolShortForPacking()) {
+        if (range.sub != nullptr && UnitPackEnabled() && !unit_cold_hash.empty()) UnitPackPass(range, slots, ColdNow(), false);
+        return;
+    }
     // Device memory nothing is bound to goes back before any guest memory is packed.
     if (&eden_radv_private_radv_ps5_eden_trim != nullptr) (void)eden_radv_private_radv_ps5_eden_trim(std::uint64_t{512} << 20);
     // Coldest first, each needing ColdSeconds << (times packed) unwritten.
@@ -2271,12 +2366,13 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
     }
     if (range.sub != nullptr && UnitPackEnabled() && !unit_cold_hash.empty()) {
         SplitColdSlots(range, ready, now);
-        UnitPackPass(range, slots, now);
+        UnitPackPass(range, slots, now, true);
     }
 }
 
 void ScanPass(SparseRange& range) noexcept {
     const auto start = std::chrono::steady_clock::now();
+    pool_short_pass.store(PackEnabled() && PoolShortForPacking(), std::memory_order_relaxed);
     const std::size_t slots = (range.end - range.begin.load(std::memory_order_relaxed)) / SparseSlot;
     std::vector<std::pair<std::uint64_t, std::size_t>> samples;
     for (std::size_t slot = 0; slot < slots; ++slot) {
@@ -2360,7 +2456,8 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         const int sub_length = std::snprintf(line, sizeof(line),
             "EDEN_CRAM_SUB %s slots=%zu units=%zuMiB store=%zuMiB pieces=%lluMiB made=%llu backed=%llu given=%llu "
             "whole=%llu from_own=%llu failures=%llu remaps=%llu own=%zuMiB unit_packed=%lluMiB unit_stored=%lluMiB "
-            "unit_packs=%llu unit_unpacks=%llu unit_skips=%llu splits=%llu moves=%llu store_held=%zuMiB\n",
+            "unit_packs=%llu unit_unpacks=%llu unit_skips=%llu splits=%llu moves=%llu store_held=%zuMiB "
+            "probes=%llu probe_hits=%llu came_back=%llu\n",
             when, sub, sub_units * SubUnit >> 20, unit_held.load(std::memory_order_relaxed) >> 20,
             (unsigned long long)(unit_live.load(std::memory_order_relaxed) * SubUnit >> 20),
             (unsigned long long)sub_made.load(), (unsigned long long)sub_backed.load(), (unsigned long long)sub_given.load(),
@@ -2368,7 +2465,8 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             (unsigned long long)sub_remaps.load(), own * (SparseSlot >> 20),
             (unsigned long long)(units_packed.load() * SubUnit >> 20), (unsigned long long)(units_packed_bytes.load() >> 20),
             (unsigned long long)unit_packs.load(), (unsigned long long)unit_unpacks.load(), (unsigned long long)unit_pack_skips.load(),
-            (unsigned long long)sub_splits.load(), (unsigned long long)unit_moves.load(), store_held.load(std::memory_order_relaxed) >> 20);
+            (unsigned long long)sub_splits.load(), (unsigned long long)unit_moves.load(), store_held.load(std::memory_order_relaxed) >> 20,
+            (unsigned long long)unit_probes.load(), (unsigned long long)unit_probe_hits.load(), (unsigned long long)unit_came_back.load());
         if (sub_length > 0) Report(line);
     }
     // Who wrote the slots that were promoted: the largest places (offsets in the app's image).
@@ -2904,7 +3002,8 @@ void ZeroSubPart(SparseRange& range, std::size_t slot, std::uint64_t offset, std
             if (whole) {
                 DropSlotAliases(range, slot);
                 GiveSubUnit(range, slot, unit);
-            } else if ((range.sub[slot] & (1u << unit)) || UnpackUnit(range, slot, unit)) {
+            } else if (((range.sub[slot] & (1u << unit)) && BackSubUnit(range, slot, unit)) || UnpackUnit(range, slot, unit)) {
+                // (BackSubUnit: a unit on probation is read-write again first)
                 std::memset(reinterpret_cast<void*>(at + cursor % SparseSlot), 0, static_cast<std::size_t>(unit_end - cursor));
             }
             // (a packed unit that found no piece to unpack into keeps its bytes: freed pages, unread)

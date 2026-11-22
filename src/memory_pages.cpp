@@ -292,6 +292,7 @@ struct SparseRange {
     std::uint32_t* sub = nullptr;       // per slot: the 64 KiB units a Sub slot backs (a bit each)
     std::uint32_t* sub_unit = nullptr;  // per unit (32 a slot): its piece of the unit store, + 1 (0: none)
     std::uint32_t* sub_packed = nullptr; // per slot: the units packed into the store (a bit each)
+    std::uint32_t* sub_probe = nullptr;  // per slot: backed units made no-access to see whether they are touched
     std::uint32_t* unit_pack_at = nullptr; // per unit: where its packed bytes are in the store, + 1
     std::uint16_t* unit_pack_size = nullptr; // per unit: how many
     // Guest range only: per slot, the 64-bit fastmem window's regions that show its block
@@ -419,6 +420,8 @@ void ReleaseSparse(SparseRange& range) {
     range.sub_unit = nullptr;
     delete[] range.sub_packed;
     range.sub_packed = nullptr;
+    delete[] range.sub_probe;
+    range.sub_probe = nullptr;
     delete[] range.unit_pack_at;
     range.unit_pack_at = nullptr;
     delete[] range.unit_pack_size;

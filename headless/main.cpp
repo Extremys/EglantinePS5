@@ -1289,6 +1289,8 @@ int main(int argc, char** argv) {
                 }
                 // Its first area runs the 12 GiB pool out: 4 arenas a thread (the heap's cap reads
                 // the switch until it is set) played 131 s past the first scene against 16-30 s.
+                // Its guest memory packs early, with a 512 MiB writers' reserve: 117 s past the
+                // first scene against 45 s with the defaults (64 KiB unit packing, e99ccb8).
                 if (eden_game_title_id(guest) == 0x0400486024DEC000ULL) {
                     setenv("EDEN_HEAP_THREAD_ARENAS_MAX", "4", 0);
                     // Device memory arrives with whatever the pool held. OoT's water ripple
@@ -1297,6 +1299,8 @@ int main(int argc, char** argv) {
                     // its pixels (blue, blinking trees). RADV's zerovram: a frame dump at 225 s had
                     // no NaN in the scene, against 1.1 million pixels without it.
                     if (!std::getenv("RADV_DEBUG")) setenv("RADV_DEBUG", "zerovram", 1);
+                    setenv("EDEN_CRAM_RESERVE_MIB", "512", 0);
+                    setenv("EDEN_CRAM_PACK_BELOW_MIB", "6144", 0);
                 } else if (fallback_ours && eden_game_title_id(guest) != 0x0400486024DEC000ULL) {
                     unsetenv("EDEN_NX2_FORCE_MESH_FALLBACK");
                     fallback_ours = false;
