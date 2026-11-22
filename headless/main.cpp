@@ -1291,6 +1291,12 @@ int main(int argc, char** argv) {
                 // the switch until it is set) played 131 s past the first scene against 16-30 s.
                 if (eden_game_title_id(guest) == 0x0400486024DEC000ULL) {
                     setenv("EDEN_HEAP_THREAD_ARENAS_MAX", "4", 0);
+                    // Device memory arrives with whatever the pool held. OoT's water ripple
+                    // simulation (compute fb4203a7d928ed42 / e2ce39e630ce65f3, 256x256 ping-pong)
+                    // never clears its textures and kept NaN forever; the scene took it into 54% of
+                    // its pixels (blue, blinking trees). RADV's zerovram: a frame dump at 225 s had
+                    // no NaN in the scene, against 1.1 million pixels without it.
+                    if (!std::getenv("RADV_DEBUG")) setenv("RADV_DEBUG", "zerovram", 1);
                 } else if (fallback_ours && eden_game_title_id(guest) != 0x0400486024DEC000ULL) {
                     unsetenv("EDEN_NX2_FORCE_MESH_FALLBACK");
                     fallback_ours = false;
