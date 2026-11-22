@@ -469,6 +469,9 @@ std::uint32_t unit_used[UnitBlocks];         // a bit per piece handed out
 std::size_t unit_hint = 0, unit_count = 0;   // lowest block that may have a free piece; blocks in use end
 std::atomic<std::size_t> unit_held{0};
 std::atomic_flag unit_lock = ATOMIC_FLAG_INIT;
+std::atomic<std::int32_t> unit_map_rc{0}; // the last refused unit mapping's result (diagnostic)
+std::atomic<std::uintptr_t> unit_map_at{0};
+std::atomic<std::uint64_t> sub_remaps{0}; // a unit's own mapping refused: the slot mapped again whole
 
 std::uint8_t* UnitView(std::uint32_t code) noexcept {
     return reinterpret_cast<std::uint8_t*>(unit_base + (code - 1) / SubUnits * SparseSlot + (code - 1) % SubUnits * SubUnit);
@@ -558,8 +561,11 @@ void UnitGive(std::uint32_t code) noexcept {
 }
 bool MapUnits(std::uintptr_t at, std::size_t bytes, int protection, std::int64_t physical) noexcept {
     void* address = reinterpret_cast<void*>(at);
-    return sceKernelMapDirectMemory(&address, bytes, protection, MAP_FIXED, physical, FinePage) == 0 &&
-           address == reinterpret_cast<void*>(at);
+    const std::int32_t rc = sceKernelMapDirectMemory(&address, bytes, protection, MAP_FIXED, physical, FinePage);
+    if (rc == 0 && address == reinterpret_cast<void*>(at)) return true;
+    unit_map_rc.store(rc != 0 ? rc : -1, std::memory_order_relaxed);
+    unit_map_at.store(at, std::memory_order_relaxed);
+    return false;
 }
 // The slot (its 2 MiB mapping taken away whole first: a large mapping is never split) mapped unit by
 // unit: `codes[u]` read-write where it is set, the zero block read-only elsewhere. False: nothing is
@@ -612,10 +618,20 @@ bool BackSubUnit(SparseRange& range, std::size_t slot, std::size_t unit) noexcep
     if (range.sub[slot] & (1u << unit)) return true;
     std::uint32_t code = 0;
     if (!UnitTake(&code)) return false;
-    if (!MapUnits(SlotAddress(range, slot) + unit * SubUnit, SubUnit, PROT_READ | PROT_WRITE, UnitPhysical(code))) {
-        UnitGive(code); // the unit still shows the zero block
-        sub_failures.fetch_add(1, std::memory_order_relaxed);
-        return false;
+    const std::uintptr_t at = SlotAddress(range, slot);
+    if (!MapUnits(at + unit * SubUnit, SubUnit, PROT_READ | PROT_WRITE, UnitPhysical(code))) {
+        // The system may refuse to map into part of a run: the slot is mapped again run by run.
+        std::uint32_t codes[SubUnits];
+        for (std::size_t u = 0; u < SubUnits; ++u) codes[u] = range.sub_unit[slot * SubUnits + u];
+        codes[unit] = code;
+        sub_remaps.fetch_add(1, std::memory_order_relaxed);
+        if (!MapSub(at, codes)) {
+            codes[unit] = 0;
+            if (!MapSub(at, codes)) std::abort(); // the slot as it was: its data must stay reachable
+            UnitGive(code);
+            sub_failures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
     }
     range.sub[slot] |= 1u << unit;
     range.sub_unit[slot * SubUnits + unit] = code;
@@ -630,8 +646,13 @@ bool BackSubUnit(SparseRange& range, std::size_t slot, std::size_t unit) noexcep
 // unit holds only zeroes, fenced).
 void GiveSubUnit(SparseRange& range, std::size_t slot, std::size_t unit) noexcept {
 #ifdef PS5_NATIVE
-    if (!MapUnits(SlotAddress(range, slot) + unit * SubUnit, SubUnit, PROT_READ, zero_block + std::int64_t(unit * SubUnit)))
-        std::abort();
+    if (!MapUnits(SlotAddress(range, slot) + unit * SubUnit, SubUnit, PROT_READ, zero_block + std::int64_t(unit * SubUnit))) {
+        std::uint32_t codes[SubUnits];
+        for (std::size_t u = 0; u < SubUnits; ++u) codes[u] = range.sub_unit[slot * SubUnits + u];
+        codes[unit] = 0;
+        sub_remaps.fetch_add(1, std::memory_order_relaxed);
+        if (!MapSub(SlotAddress(range, slot), codes)) std::abort();
+    }
     UnitGive(std::exchange(range.sub_unit[slot * SubUnits + unit], 0u));
     range.sub[slot] &= ~(1u << unit);
     sub_given.fetch_add(1, std::memory_order_relaxed);
@@ -2004,12 +2025,12 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         // units: what Sub slots back; store: the 2 MiB blocks the pieces come from (in held).
         const int sub_length = std::snprintf(line, sizeof(line),
             "EDEN_CRAM_SUB %s slots=%zu units=%zuMiB store=%zuMiB pieces=%lluMiB made=%llu backed=%llu given=%llu "
-            "whole=%llu from_own=%llu failures=%llu own=%zuMiB\n",
+            "whole=%llu from_own=%llu failures=%llu remaps=%llu own=%zuMiB\n",
             when, sub, sub_units * SubUnit >> 20, unit_held.load(std::memory_order_relaxed) >> 20,
             (unsigned long long)(unit_live.load(std::memory_order_relaxed) * SubUnit >> 20),
             (unsigned long long)sub_made.load(), (unsigned long long)sub_backed.load(), (unsigned long long)sub_given.load(),
             (unsigned long long)sub_whole.load(), (unsigned long long)sub_from_own.load(), (unsigned long long)sub_failures.load(),
-            own * (SparseSlot >> 20));
+            (unsigned long long)sub_remaps.load(), own * (SparseSlot >> 20));
         if (sub_length > 0) Report(line);
     }
     // Who wrote the slots that were promoted: the largest places (offsets in the app's image).
@@ -2210,6 +2231,8 @@ bool ServiceAvailable() noexcept {
                 // goes back on a scan; then made Own with every byte where it was, and Sub again.
                 // A failure here turns Sub slots off, not the service.
                 const char* sub_step = "ok";
+                const auto faults_before = counters.faults.load(), backed_before = sub_backed.load(),
+                           made_before = sub_made.load(), failed_before = sub_failures.load();
                 LockSlot(*range, 1);
                 if (SlotState(*range, 1) != SlotZero) ReturnSlot(*range, 1);
                 UnlockSlot(*range, 1, SlotZero);
@@ -2241,8 +2264,26 @@ bool ServiceAvailable() noexcept {
                 }
                 if (std::strcmp(sub_step, "ok") != 0) {
                     sub_state.store(2, std::memory_order_release);
-                    char sub_line[96];
-                    const int n = std::snprintf(sub_line, sizeof(sub_line), "EDEN_CRAM_SUB off: the check failed at %s\n", sub_step);
+                    // What the slot and the zero block show now (a write that did not fault lands in
+                    // the zero block, which every untouched slot shows).
+                    unsigned long long zero_at_unit6 = ~0ull;
+#ifdef PS5_NATIVE
+                    void* zero_view = reinterpret_cast<void*>(cpu_mapping_hint);
+                    if (sceKernelMapDirectMemory(&zero_view, SparseSlot, PROT_READ, 0, zero_block, SparseSlot) == 0) {
+                        zero_at_unit6 = *reinterpret_cast<const volatile std::uint64_t*>(static_cast<std::uint8_t*>(zero_view) + 6 * SubUnit);
+                        (void)munmap(zero_view, SparseSlot);
+                    }
+#endif
+                    char sub_line[400];
+                    const int n = std::snprintf(sub_line, sizeof(sub_line),
+                        "EDEN_CRAM_SUB off: the check failed at %s state=%u mask=%#x unit5=%#llx unit6=%#llx word=%#llx "
+                        "faults=+%llu made=+%llu backed=+%llu failures=+%llu remaps=%llu map_rc=%#x map_at=+%#llx zero_block_unit6=%#llx\n",
+                        sub_step, unsigned(SlotState(*range, 1)), range->sub[1], (unsigned long long)*unit5,
+                        (unsigned long long)*unit6, (unsigned long long)*word,
+                        (unsigned long long)(counters.faults.load() - faults_before), (unsigned long long)(sub_made.load() - made_before),
+                        (unsigned long long)(sub_backed.load() - backed_before), (unsigned long long)(sub_failures.load() - failed_before),
+                        (unsigned long long)sub_remaps.load(), unsigned(unit_map_rc.load()),
+                        (unsigned long long)(unit_map_at.load() ? unit_map_at.load() - SlotAddress(*range, 0) : 0), zero_at_unit6);
                     if (n > 0) Report(sub_line);
                 }
             }
