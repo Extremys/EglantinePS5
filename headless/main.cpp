@@ -1286,6 +1286,11 @@ int main(int argc, char** argv) {
                     setenv("EDEN_NX2_FORCE_MESH_FALLBACK", "1", 1);
                     fallback_ours = true;
                     Eden::Report("launch", "Ocarina of Time: task/mesh draws take the compute fallback");
+                }
+                // Its first area runs the 12 GiB pool out: 4 arenas a thread (the heap's cap reads
+                // the switch until it is set) played 131 s past the first scene against 16-30 s.
+                if (eden_game_title_id(guest) == 0x0400486024DEC000ULL) {
+                    setenv("EDEN_HEAP_THREAD_ARENAS_MAX", "4", 0);
                 } else if (fallback_ours && eden_game_title_id(guest) != 0x0400486024DEC000ULL) {
                     unsetenv("EDEN_NX2_FORCE_MESH_FALLBACK");
                     fallback_ours = false;
