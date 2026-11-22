@@ -473,6 +473,23 @@ int main(int argc, char** argv) {
             else launch_error = "Forwarded game not found: " + (path.empty() ? forwarded.rom : path);
             Eden::BootTrace::Line("forwarded game: %s", forwarded_game.empty() ? "not found" : "found");
         }
+        // One-shot test launch without a controller: /data/eglantineps5/autoboot.txt names a game
+        // like --rom does (the PS5 shell's launch passes no arguments). Removed before the game
+        // loads, so a crash comes back to the library and never loops.
+        if (forwarded_game.empty() && last_crash.report.empty()) {
+            const std::string request_path = std::string{Eden::kDataDir} + "/autoboot.txt";
+            std::ifstream request_file(request_path);
+            std::string rom;
+            if (std::getline(request_file, rom)) {
+                request_file.close();
+                if (std::remove(request_path.c_str()) == 0) {
+                    std::string path = Eden::ResolveForwardedRom(rom, Eden::AssetsPath("roms"));
+                    if (const auto main = Eden::ExtractedGameMain(path); !main.empty()) path = main;
+                    if (!path.empty() && Eden::FileExists(path)) forwarded_game = path;
+                    Eden::BootTrace::Line("autoboot.txt game: %s", forwarded_game.empty() ? "not found" : "found");
+                }
+            }
+        }
 #ifdef MKW_DIAGNOSTIC_INPUT
         // One-shot launch for an explicitly prepared console experiment. Consume it before
         // loading so a crash returns to the normal library and never loops the diagnostic.
