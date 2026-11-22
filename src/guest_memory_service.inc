@@ -2130,6 +2130,9 @@ bool ServiceAvailable() noexcept {
             step = "states";
         } else {
             probe_range.store(range, std::memory_order_release);
+            // The checks of whole slots first, with Sub slots hidden (a first write would make slot 1
+            // Sub, not Own); the Sub step below has them back. Its failure turns off Sub only.
+            std::uint32_t* const sub_states = std::exchange(range->sub, nullptr);
             auto* word = reinterpret_cast<volatile std::uint64_t*>(static_cast<std::uint8_t*>(base) + SparseSlot + 64);
             const auto before = counters.faults.load(std::memory_order_relaxed);
             probe_expected.store(reinterpret_cast<std::uintptr_t>(word), std::memory_order_release);
@@ -2201,6 +2204,7 @@ bool ServiceAvailable() noexcept {
                         step = "fine-write";
                 }
             }
+            range->sub = sub_states;
             if (std::strcmp(step, "ok") == 0 && range->sub != nullptr) {
                 // Sub: slot 1 written at unit 5 backs that unit only; unit 6 next; unit 6 zeroed again
                 // goes back on a scan; then made Own with every byte where it was, and Sub again.
