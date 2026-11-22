@@ -291,6 +291,9 @@ struct SparseRange {
     std::uint32_t* fine_after = nullptr; // per slot: the scan pass from which it may be made Fine again
     std::uint32_t* sub = nullptr;       // per slot: the 64 KiB units a Sub slot backs (a bit each)
     std::uint32_t* sub_unit = nullptr;  // per unit (32 a slot): its piece of the unit store, + 1 (0: none)
+    std::uint32_t* sub_packed = nullptr; // per slot: the units packed into the store (a bit each)
+    std::uint32_t* unit_pack_at = nullptr; // per unit: where its packed bytes are in the store, + 1
+    std::uint16_t* unit_pack_size = nullptr; // per unit: how many
     // Guest range only: per slot, the 64-bit fastmem window's regions that show its block
     // (guest_memory_service.inc, AliasesPerSlot entries each; src/host_memory.cpp, Window64).
     std::uintptr_t* aliases = nullptr;
@@ -414,6 +417,12 @@ void ReleaseSparse(SparseRange& range) {
     range.sub = nullptr;
     delete[] range.sub_unit;
     range.sub_unit = nullptr;
+    delete[] range.sub_packed;
+    range.sub_packed = nullptr;
+    delete[] range.unit_pack_at;
+    range.unit_pack_at = nullptr;
+    delete[] range.unit_pack_size;
+    range.unit_pack_size = nullptr;
     delete[] range.aliases;
     range.aliases = nullptr;
     range.begin.store(0, std::memory_order_release);
