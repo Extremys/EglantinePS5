@@ -2320,6 +2320,76 @@ void ColdPass(SparseRange& range, std::size_t slots) noexcept {
 }
 
 
+
+// ---- Compacting the packed store ----
+// Packed data goes back piece by piece (unpacked, given back) and leaves store blocks part empty; a
+// block goes back only once it holds nothing. While the store's blocks hold 64 MiB more than their data,
+// each pass moves the data of the emptiest blocks (under half full) into the block being filled, up to
+// 256 MiB a pass, under each slot's lock (the fault handler reads packed data under it), and the blocks
+// it emptied go back (pack_mutex held).
+std::atomic<std::uint64_t> store_moved{0};
+#ifdef PS5_NATIVE
+bool store_source[StoreBlocks];
+bool InSource(std::uintptr_t data) noexcept {
+    return data >= store_base && store_source[(data - store_base) / StoreBlock];
+}
+void CompactStore(SparseRange& range, std::size_t slots) noexcept {
+    if (store_base == 0) return;
+    std::size_t held = 0, live = 0;
+    for (std::size_t i = 0; i < StoreBlocks; ++i)
+        if (store_physical[i] >= 0) held += StoreBlock, live += store_live[i].load(std::memory_order_relaxed);
+    if (held < live + (std::size_t{64} << 20)) return;
+    // Sources: the emptiest blocks under half full, never the one being filled.
+    std::size_t moving = 0;
+    for (std::size_t i = 0; i < StoreBlocks; ++i) store_source[i] = false;
+    for (std::size_t fill = StoreBlock / 8; fill <= StoreBlock / 2 && moving < (std::size_t{256} << 20); fill += StoreBlock / 8)
+        for (std::size_t i = 0; i < StoreBlocks && moving < (std::size_t{256} << 20); ++i) {
+            const std::size_t here = store_live[i].load(std::memory_order_relaxed);
+            if (store_physical[i] < 0 || i == store_current || store_source[i] || here >= fill) continue;
+            store_source[i] = true;
+            moving += here;
+        }
+    if (moving == 0) return;
+    PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+        const std::uint8_t state = SlotState(range, slot);
+        const bool whole = state == SlotPacked && table != nullptr && InSource(reinterpret_cast<std::uintptr_t>(table[slot].data));
+        bool units = false;
+        if (state == SlotSub && range.sub_packed != nullptr && range.sub_packed[slot] != 0)
+            for (std::size_t unit = 0; unit < SubUnits && !units; ++unit)
+                units = (range.sub_packed[slot] & (1u << unit)) && InSource(store_base + range.unit_pack_at[slot * SubUnits + unit] - 1);
+        if (!whole && !units) continue;
+        LockSlot(range, slot);
+        const std::uint8_t now = SlotState(range, slot);
+        if (now == SlotPacked && table != nullptr && InSource(reinterpret_cast<std::uintptr_t>(table[slot].data))) {
+            if (void* to = StoreAlloc(table[slot].size, nullptr)) {
+                // (StoreAlloc never fills a source: they are not the block being filled)
+                std::memcpy(to, table[slot].data, table[slot].size);
+                StoreRelease(table[slot].data, table[slot].size);
+                table[slot].data = to;
+                store_moved.fetch_add(table[slot].size, std::memory_order_relaxed);
+            }
+        } else if (now == SlotSub && range.sub_packed != nullptr) {
+            for (std::size_t unit = 0; unit < SubUnits; ++unit) {
+                const std::size_t index = slot * SubUnits + unit;
+                if (!(range.sub_packed[slot] & (1u << unit))) continue;
+                const std::uintptr_t from = store_base + range.unit_pack_at[index] - 1;
+                if (!InSource(from)) continue;
+                void* to = StoreAlloc(range.unit_pack_size[index], nullptr);
+                if (to == nullptr) break;
+                std::memcpy(to, reinterpret_cast<const void*>(from), range.unit_pack_size[index]);
+                StoreRelease(reinterpret_cast<void*>(from), range.unit_pack_size[index]);
+                range.unit_pack_at[index] = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(to) - store_base + 1);
+                store_moved.fetch_add(range.unit_pack_size[index], std::memory_order_relaxed);
+            }
+        }
+        UnlockSlot(range, slot, now);
+    }
+    for (std::size_t i = 0; i < StoreBlocks; ++i) store_source[i] = false;
+    StoreReclaim();
+}
+#endif
+
 void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& candidates) noexcept {
 #ifdef PS5_NATIVE
     StoreReclaim();
@@ -2342,6 +2412,9 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
         pack_scratch.resize(static_cast<std::size_t>(LZ4_compressBound(static_cast<int>(SparseSlot))));
     }
     if (pack_refused.load(std::memory_order_relaxed)) return;
+#ifdef PS5_NATIVE
+    CompactStore(range, slots);
+#endif
     if (!PoolShortForPacking()) {
         if (range.sub != nullptr && UnitPackEnabled() && !unit_cold_hash.empty()) UnitPackPass(range, slots, ColdNow(), false);
         return;
@@ -2432,7 +2505,7 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             fine_kept += FineKept(range, slot);
         }
     }
-    char line[640];
+    char line[900];
     const int length = std::snprintf(line, sizeof(line),
         "EDEN_CRAM %s held=%zuMiB own=%zu shared=%zu zero=%zu faults=%llu promotions=%llu copies=%llu waits=%llu "
         "returns_clear=%llu returns_free=%llu returns_scan=%llu dedup=%llu reserve_used=%llu failures=%llu "
@@ -2453,11 +2526,17 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
     if (length > 0) Report(line);
     if (range.sub != nullptr) {
         // units: what Sub slots back; store: the 2 MiB blocks the pieces come from (in held).
+        // pager_total: what the pager takes from the pool (held, the packed store, the writers' reserve
+        // and the blocks kept for unpacking).
+        const std::uint64_t store_data = packed_bytes.load(std::memory_order_relaxed) + units_packed_bytes.load(std::memory_order_relaxed);
+        const std::size_t reserve_mib = reserve_count.load(std::memory_order_relaxed) * (SparseSlot >> 20);
+        const std::size_t keep_mib = unpack_keep_count.load(std::memory_order_relaxed) * (SparseSlot >> 20);
         const int sub_length = std::snprintf(line, sizeof(line),
             "EDEN_CRAM_SUB %s slots=%zu units=%zuMiB store=%zuMiB pieces=%lluMiB made=%llu backed=%llu given=%llu "
             "whole=%llu from_own=%llu failures=%llu remaps=%llu own=%zuMiB unit_packed=%lluMiB unit_stored=%lluMiB "
             "unit_packs=%llu unit_unpacks=%llu unit_skips=%llu splits=%llu moves=%llu store_held=%zuMiB "
-            "probes=%llu probe_hits=%llu came_back=%llu\n",
+            "probes=%llu probe_hits=%llu came_back=%llu store_data=%lluMiB store_slack=%lldMiB store_moved=%lluMiB "
+            "reserve=%zuMiB unpack_keep=%zuMiB pager_total=%zuMiB\n",
             when, sub, sub_units * SubUnit >> 20, unit_held.load(std::memory_order_relaxed) >> 20,
             (unsigned long long)(unit_live.load(std::memory_order_relaxed) * SubUnit >> 20),
             (unsigned long long)sub_made.load(), (unsigned long long)sub_backed.load(), (unsigned long long)sub_given.load(),
@@ -2466,7 +2545,10 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             (unsigned long long)(units_packed.load() * SubUnit >> 20), (unsigned long long)(units_packed_bytes.load() >> 20),
             (unsigned long long)unit_packs.load(), (unsigned long long)unit_unpacks.load(), (unsigned long long)unit_pack_skips.load(),
             (unsigned long long)sub_splits.load(), (unsigned long long)unit_moves.load(), store_held.load(std::memory_order_relaxed) >> 20,
-            (unsigned long long)unit_probes.load(), (unsigned long long)unit_probe_hits.load(), (unsigned long long)unit_came_back.load());
+            (unsigned long long)unit_probes.load(), (unsigned long long)unit_probe_hits.load(), (unsigned long long)unit_came_back.load(),
+            (unsigned long long)(store_data >> 20), (long long)(store_held.load(std::memory_order_relaxed) >> 20) - (long long)(store_data >> 20),
+            (unsigned long long)(store_moved.load() >> 20), reserve_mib, keep_mib,
+            (guest_committed.load(std::memory_order_relaxed) >> 20) + (store_held.load(std::memory_order_relaxed) >> 20) + reserve_mib + keep_mib);
         if (sub_length > 0) Report(line);
     }
     // Who wrote the slots that were promoted: the largest places (offsets in the app's image).
