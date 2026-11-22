@@ -443,14 +443,33 @@ bool SubEnabled() noexcept {
     }
     return state == 1;
 }
-// A Sub slot with this many units backed is made Own; an Own slot with this many units of zeroes Sub.
+// A Sub slot with this many units backed is made Own (EDEN_CRAM_SUB_WHOLE; default 0: never, as PS5
+// Lichii, whose guest memory is 64 KiB units throughout); an Own slot with this many units of zeroes Sub.
 std::size_t SubWholeUnits() noexcept {
     static const std::size_t units = [] {
         const char* value = std::getenv("EDEN_CRAM_SUB_WHOLE");
-        const std::size_t n = value != nullptr && *value ? std::strtoull(value, nullptr, 10) : 28;
-        return std::clamp<std::size_t>(n, 1, SubUnits);
+        const std::size_t n = value != nullptr && *value ? std::strtoull(value, nullptr, 10) : 0;
+        return std::min<std::size_t>(n, SubUnits);
     }();
     return units;
+}
+// Every Own slot (an unpacked whole slot, one made whole) is made Sub on the next pass, up to
+// SplitPerPass a pass (EDEN_CRAM_SUB_SPLIT_ALL=0: only those with SubMinZeroUnits units of zeroes).
+bool SubSplitAll() noexcept {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_CRAM_SUB_SPLIT_ALL");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+// While the pool is short, a unit untouched for this long goes on probation (EDEN_CRAM_UNIT_COLD_S,
+// default 5: one pass, as Lichii); twice as long for each time it came back, up to 64 times.
+std::size_t UnitColdSeconds() noexcept {
+    static const std::size_t seconds = [] {
+        const char* value = std::getenv("EDEN_CRAM_UNIT_COLD_S");
+        return value != nullptr && *value ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : std::size_t{5};
+    }();
+    return seconds;
 }
 std::size_t SubMinZeroUnits() noexcept {
     static const std::size_t units = [] {
@@ -1651,7 +1670,8 @@ void ScanSubSlot(SparseRange& range, std::size_t slot) noexcept {
         if ((seen & (1u << unit)) && UnitZero(at + unit * SubUnit)) zero |= 1u << unit;
     // Not made whole while it has packed units, or while packing has a short pool to answer (a slot
     // split for packing would be made whole again before its units are cold).
-    const bool whole = static_cast<std::size_t>(__builtin_popcount(seen)) >= SubWholeUnits() && range.sub_packed[slot] == 0 &&
+    const bool whole = SubWholeUnits() != 0 && static_cast<std::size_t>(__builtin_popcount(seen)) >= SubWholeUnits() &&
+                       range.sub_packed[slot] == 0 &&
                        counters.passes.load(std::memory_order_relaxed) >= range.fine_after[slot] && !pool_short_pass.load(std::memory_order_relaxed);
     if (zero == 0 && !whole) return;
     LockSlot(range, slot);
@@ -1672,7 +1692,7 @@ void ScanSubSlot(SparseRange& range, std::size_t slot) noexcept {
         ReturnSub(range, slot);
         counters.returns_scan.fetch_add(1, std::memory_order_relaxed);
         to = SlotZero;
-    } else if (whole && static_cast<std::size_t>(__builtin_popcount(range.sub[slot])) >= SubWholeUnits() &&
+    } else if (whole && static_cast<std::size_t>(__builtin_popcount(range.sub[slot])) >= SubWholeUnits() && SubWholeUnits() != 0 &&
                range.sub_packed[slot] == 0 && PromoteSub(range, slot)) {
         // Made whole: it may be Sub again after the same back-off as a Fine slot made whole.
         const unsigned times = std::min<unsigned>(((range.fine[slot] >> 8) & 0xf) + 1, FineBackoffMax);
@@ -1981,7 +2001,7 @@ std::vector<std::uint8_t> unit_pack_times; // how often it came back (touched on
 std::vector<std::uint8_t> unit_mark;       // what the scanner did last: 1 put it on probation, 2 packed it
 constexpr unsigned UnitBackoffMax = 6;     // ColdSeconds << 6: 32 minutes
 std::vector<std::uint32_t> unit_ready; // slot * 32 + unit, room made once
-constexpr std::size_t UnitPackPerPass = 8192;  // 512 MiB of units
+constexpr std::size_t UnitPackPerPass = 32768; // 2 GiB of units (Lichii: every cold unit, every pass)
 constexpr std::size_t SplitPerPass = 256;      // 512 MiB of slots
 constexpr std::size_t MovePerPass = 4096;      // 256 MiB of pieces
 std::uint64_t UnitHash(std::uintptr_t at) noexcept {
@@ -2135,7 +2155,7 @@ void UnitPackPass(SparseRange& range, std::size_t slots, std::uint32_t now, bool
             }
         }
     }
-    const std::uint32_t cold = short_pool ? static_cast<std::uint32_t>(ColdSeconds) : static_cast<std::uint32_t>(UnitPackEarlySeconds());
+    const std::uint32_t cold = short_pool ? static_cast<std::uint32_t>(UnitColdSeconds()) : static_cast<std::uint32_t>(UnitPackEarlySeconds());
     if (cold == 0) return;
     std::vector<std::uint32_t>& ready = unit_ready;
     ready.clear();
@@ -2144,7 +2164,7 @@ void UnitPackPass(SparseRange& range, std::size_t slots, std::uint32_t now, bool
         const std::uint32_t candidates = range.sub[slot] & ~range.sub_probe[slot];
         for (std::size_t unit = 0; unit < SubUnits; ++unit) {
             const std::size_t index = slot * SubUnits + unit;
-            if ((candidates & (1u << unit)) && unit_cold_hash[index] != 0 && unit_mark[index] == 0 &&
+            if ((candidates & (1u << unit)) && (unit_cold_hash[index] != 0 || short_pool) && unit_mark[index] == 0 &&
                 now - unit_cold_since[index] >= (cold << unit_pack_times[index]))
                 ready.push_back(static_cast<std::uint32_t>(index));
         }
@@ -2446,6 +2466,7 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
 void ScanPass(SparseRange& range) noexcept {
     const auto start = std::chrono::steady_clock::now();
     pool_short_pass.store(PackEnabled() && PoolShortForPacking(), std::memory_order_relaxed);
+    std::size_t splits = 0;
     const std::size_t slots = (range.end - range.begin.load(std::memory_order_relaxed)) / SparseSlot;
     std::vector<std::pair<std::uint64_t, std::size_t>> samples;
     for (std::size_t slot = 0; slot < slots; ++slot) {
@@ -2455,7 +2476,9 @@ void ScanPass(SparseRange& range) noexcept {
         if (AllZero(at)) { // a read without the lock: only a hint, checked again fenced
             if (ScanZero(range, slot)) counters.returns_scan.fetch_add(1, std::memory_order_relaxed);
         } else if (range.sub != nullptr) {
-            (void)ScanSub(range, slot); // (in place of Fine: a write to a Sub slot backs 64 KiB, not 2 MiB)
+            // (in place of Fine: a write to a Sub slot backs 64 KiB, not 2 MiB)
+            if (SubSplitAll() && splits < SplitPerPass) splits += ScanSub(range, slot, 0) ? 1 : 0;
+            else (void)ScanSub(range, slot);
         } else if (fine_requested.load(std::memory_order_relaxed) && ScanFine(range, slot)) {
             // now Fine
         } else if (dedup_requested.load(std::memory_order_relaxed)) {
@@ -2635,7 +2658,9 @@ void ScannerLoop(SparseRange* range) {
     std::unique_lock lock{scanner_mutex};
     while (!scanner_stop) {
         // Every 20 s; every 5 s while packing has a short pool to answer (the game grows ~10 MiB/s).
-        const bool hurry = PackEnabled() && !pack_refused.load(std::memory_order_relaxed) && PoolShortForPacking();
+        // (every 5 s too with Sub slots: units of zeroes go back and cold units are probed each pass, as Lichii)
+        const bool hurry = (PackEnabled() && !pack_refused.load(std::memory_order_relaxed) && PoolShortForPacking()) ||
+                           range->sub != nullptr;
         scanner_wake.wait_for(lock, std::chrono::seconds(hurry ? 5 : 20), [] { return scanner_stop; });
         if (scanner_stop) break;
         lock.unlock();
