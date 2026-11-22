@@ -589,6 +589,12 @@ bool UnitTake(std::uint32_t*) noexcept { return false; }
 void UnitGive(std::uint32_t) noexcept {}
 #endif
 
+// A Sub slot's units as the fault handler left them: the self-test reads them after its own writes,
+// which the handler serves behind the compiler's back (a plain read may be a stale value).
+std::uint32_t SubMaskNow(SparseRange& range, std::size_t slot) noexcept {
+    std::atomic_signal_fence(std::memory_order_seq_cst); // after the writes that faulted
+    return __atomic_load_n(&range.sub[slot], __ATOMIC_ACQUIRE);
+}
 // Zero -> Sub: the written unit gets a piece of its own (the slot is locked).
 bool PromoteZeroSub(SparseRange& range, std::size_t slot, std::size_t unit) noexcept {
 #ifdef PS5_NATIVE
@@ -2239,15 +2245,15 @@ bool ServiceAvailable() noexcept {
                 auto* unit5 = reinterpret_cast<volatile std::uint64_t*>(static_cast<std::uint8_t*>(base) + SparseSlot + 5 * SubUnit + 8);
                 auto* unit6 = reinterpret_cast<volatile std::uint64_t*>(static_cast<std::uint8_t*>(base) + SparseSlot + 6 * SubUnit);
                 *unit5 = 0x5ab5ab5ab5ab5ull;
-                if (SlotState(*range, 1) != SlotSub || range->sub[1] != (1u << 5) || *unit5 != 0x5ab5ab5ab5ab5ull || *word != 0)
+                if (SlotState(*range, 1) != SlotSub || SubMaskNow(*range, 1) != (1u << 5) || *unit5 != 0x5ab5ab5ab5ab5ull || *word != 0)
                     sub_step = "sub";
                 else {
                     *unit6 = 6;
-                    if (range->sub[1] != (3u << 5) || *unit6 != 6 || *unit5 != 0x5ab5ab5ab5ab5ull) sub_step = "sub-second";
+                    if (SubMaskNow(*range, 1) != (3u << 5) || *unit6 != 6 || *unit5 != 0x5ab5ab5ab5ab5ull) sub_step = "sub-second";
                     else {
                         *unit6 = 0;
                         ScanSubSlot(*range, 1);
-                        if (range->sub[1] != (1u << 5) || SlotState(*range, 1) != SlotSub || *unit5 != 0x5ab5ab5ab5ab5ull)
+                        if (SubMaskNow(*range, 1) != (1u << 5) || SlotState(*range, 1) != SlotSub || *unit5 != 0x5ab5ab5ab5ab5ull)
                             sub_step = "sub-give";
                         else {
                             LockSlot(*range, 1);
@@ -2256,7 +2262,7 @@ bool ServiceAvailable() noexcept {
                             range->fine_after[1] = 0;
                             if (!whole || *unit5 != 0x5ab5ab5ab5ab5ull || *unit6 != 0) sub_step = "sub-whole";
                             else if ((*word = 21, *word != 21)) sub_step = "sub-own-write";
-                            else if (!ScanSub(*range, 1) || SlotState(*range, 1) != SlotSub || range->sub[1] != ((1u << 5) | 1u) ||
+                            else if (!ScanSub(*range, 1) || SlotState(*range, 1) != SlotSub || SubMaskNow(*range, 1) != ((1u << 5) | 1u) ||
                                      *unit5 != 0x5ab5ab5ab5ab5ull || *word != 21)
                                 sub_step = "sub-from-own";
                         }
@@ -2278,7 +2284,7 @@ bool ServiceAvailable() noexcept {
                     const int n = std::snprintf(sub_line, sizeof(sub_line),
                         "EDEN_CRAM_SUB off: the check failed at %s state=%u mask=%#x unit5=%#llx unit6=%#llx word=%#llx "
                         "faults=+%llu made=+%llu backed=+%llu failures=+%llu remaps=%llu map_rc=%#x map_at=+%#llx zero_block_unit6=%#llx\n",
-                        sub_step, unsigned(SlotState(*range, 1)), range->sub[1], (unsigned long long)*unit5,
+                        sub_step, unsigned(SlotState(*range, 1)), SubMaskNow(*range, 1), (unsigned long long)*unit5,
                         (unsigned long long)*unit6, (unsigned long long)*word,
                         (unsigned long long)(counters.faults.load() - faults_before), (unsigned long long)(sub_made.load() - made_before),
                         (unsigned long long)(sub_backed.load() - backed_before), (unsigned long long)(sub_failures.load() - failed_before),
