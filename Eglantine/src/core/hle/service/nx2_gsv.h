@@ -3574,6 +3574,8 @@ public:
             {814, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown814"},
             {861, &INx2GraphicsSystemSession::GetCpuImageDescriptor, "GetFeatureCpuImageDescriptor861"},
             {891, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize891"},
+            // 903 follows 901/902 like 603 and 1003: Ocarina of Time sends it when its opening movie ends.
+            {903, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown903"},
             {1003, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1003"},
             {1011, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1011"},
             {1012, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1012"},
