@@ -289,6 +289,8 @@ struct SparseRange {
     bool promote = false;               // writes to shared slots are promoted (the service runs)
     std::uint16_t* fine = nullptr;      // per slot: 16 KiB pages a Fine slot keeps (low 8 bits), times made whole (bits 8-11)
     std::uint32_t* fine_after = nullptr; // per slot: the scan pass from which it may be made Fine again
+    std::uint32_t* sub = nullptr;       // per slot: the 64 KiB units a Sub slot backs (a bit each)
+    std::uint32_t* sub_unit = nullptr;  // per unit (32 a slot): its piece of the unit store, + 1 (0: none)
     // Guest range only: per slot, the 64-bit fastmem window's regions that show its block
     // (guest_memory_service.inc, AliasesPerSlot entries each; src/host_memory.cpp, Window64).
     std::uintptr_t* aliases = nullptr;
@@ -408,6 +410,10 @@ void ReleaseSparse(SparseRange& range) {
     range.fine = nullptr;
     delete[] range.fine_after;
     range.fine_after = nullptr;
+    delete[] range.sub;
+    range.sub = nullptr;
+    delete[] range.sub_unit;
+    range.sub_unit = nullptr;
     delete[] range.aliases;
     range.aliases = nullptr;
     range.begin.store(0, std::memory_order_release);

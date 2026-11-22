@@ -12,6 +12,9 @@
 //   Fine    the slot is 128 pages of 16 KiB, read-only: its pages of zeroes show the zero block, the
 //           others a compact block that holds only them (a written slot with many pages of zeroes);
 //           a write makes it whole again, and it waits longer each time before it may be Fine again
+//   Packed  the slot's data is compressed in the store; any access faults and unpacks it
+//   Sub     the slot is 32 units of 64 KiB: units of zeroes show the zero block read-only, written
+//           units a piece of their own read-write; a write to a unit of zeroes backs that unit only
 //
 // A write to a Zero or Shared slot faults; HandleGuestWriteFault gives the slot a block of its
 // own (zeroed, or a copy) and the write repeats. So memory is no longer taken when the guest's
@@ -23,7 +26,7 @@
 // 64-bit games only: a 32-bit game's fastmem window aliases the backing, which takes it whole.
 
 namespace {
-enum : std::uint8_t { SlotZero = 0, SlotOwn = 1, SlotShared = 2, SlotFine = 3, SlotPacked = 4, SlotLock = 0x80, SlotMask = 0x7f };
+enum : std::uint8_t { SlotZero = 0, SlotOwn = 1, SlotShared = 2, SlotFine = 3, SlotPacked = 4, SlotSub = 5, SlotLock = 0x80, SlotMask = 0x7f };
 constexpr std::size_t FinePage = 16384, FinePages = SparseSlot / FinePage;
 // A written slot becomes Fine with at least this many pages of zeroes (512 KiB given back).
 constexpr std::size_t FineMinZeroPages = 32;
@@ -414,6 +417,275 @@ int UnshareBlock(std::int64_t physical) noexcept {
     return left;
 }
 
+// ---- Sub slots: backed 64 KiB at a time ----
+// A Zero slot's first write no longer takes 2 MiB: the slot becomes Sub, mapped unit by unit, its
+// units of zeroes showing the zero block read-only and each written unit a 64 KiB piece of its own,
+// read-write. A write to a unit of zeroes faults and backs that unit only. The scanner gives back
+// units that hold only zeroes again, makes an Own slot with many units of zeroes Sub, and a Sub slot
+// with nearly every unit backed Own (one 2 MiB block: large pages, and packing). Ocarina of Time
+// held 3.6-4.4 GB in written 2 MiB slots where PS5 Lichii, backed 64 KiB at a time, held ~1.8 GB.
+// The pieces come from 2 MiB blocks of the service's own (the unit store), so the pool's free 2 MiB
+// blocks are not cut up. guest_committed counts those blocks, not the units in them.
+// EDEN_CRAM_SUB=0 turns it off (the slot is promoted whole, as before).
+constexpr std::size_t SubUnit = 0x10000, SubUnits = SparseSlot / SubUnit; // 32: a bit each in a uint32
+constexpr std::size_t UnitBlocks = 8192; // up to 16 GiB of pieces
+std::atomic<int> sub_state{0};           // 0 not decided, 1 on, 2 off
+bool SubEnabled() noexcept {
+    int state = sub_state.load(std::memory_order_acquire);
+    if (state == 0) {
+#ifdef PS5_NATIVE
+        const char* value = std::getenv("EDEN_CRAM_SUB");
+        state = value != nullptr && value[0] == '0' ? 2 : 1;
+#else
+        state = 2; // the host's guest memory is mprotect-ed whole
+#endif
+        sub_state.store(state, std::memory_order_release);
+    }
+    return state == 1;
+}
+// A Sub slot with this many units backed is made Own; an Own slot with this many units of zeroes Sub.
+std::size_t SubWholeUnits() noexcept {
+    static const std::size_t units = [] {
+        const char* value = std::getenv("EDEN_CRAM_SUB_WHOLE");
+        const std::size_t n = value != nullptr && *value ? std::strtoull(value, nullptr, 10) : 28;
+        return std::clamp<std::size_t>(n, 1, SubUnits);
+    }();
+    return units;
+}
+std::size_t SubMinZeroUnits() noexcept {
+    static const std::size_t units = [] {
+        const char* value = std::getenv("EDEN_CRAM_SUB_MIN_ZERO");
+        const std::size_t n = value != nullptr && *value ? std::strtoull(value, nullptr, 10) : 8;
+        return std::clamp<std::size_t>(n, 1, SubUnits);
+    }();
+    return units;
+}
+std::atomic<std::uint64_t> sub_made{0}, sub_backed{0}, sub_given{0}, sub_whole{0}, sub_from_own{0}, sub_failures{0};
+std::atomic<std::uint64_t> unit_live{0}; // pieces handed out
+
+std::uintptr_t unit_base = 0;                // the store's view: block i at unit_base + i * SparseSlot
+std::int64_t unit_physical[UnitBlocks];      // -1: no block
+std::uint32_t unit_used[UnitBlocks];         // a bit per piece handed out
+std::size_t unit_hint = 0, unit_count = 0;   // lowest block that may have a free piece; blocks in use end
+std::atomic<std::size_t> unit_held{0};
+std::atomic_flag unit_lock = ATOMIC_FLAG_INIT;
+
+std::uint8_t* UnitView(std::uint32_t code) noexcept {
+    return reinterpret_cast<std::uint8_t*>(unit_base + (code - 1) / SubUnits * SparseSlot + (code - 1) % SubUnits * SubUnit);
+}
+std::int64_t UnitPhysical(std::uint32_t code) noexcept {
+    return unit_physical[(code - 1) / SubUnits] + std::int64_t((code - 1) % SubUnits * SubUnit);
+}
+bool UnitZero(std::uintptr_t at) noexcept {
+    const auto* word = reinterpret_cast<const volatile std::uint64_t*>(at);
+    for (std::size_t i = 0; i < SubUnit / 8; i += 8)
+        if (word[i] | word[i + 1] | word[i + 2] | word[i + 3] | word[i + 4] | word[i + 5] | word[i + 6] | word[i + 7])
+            return false;
+    return true;
+}
+bool ReserveBlock(std::int64_t* physical) noexcept;
+#ifdef PS5_NATIVE
+// Before the first slot is Sub (not from a signal handler).
+bool UnitStart() noexcept {
+    if (unit_base != 0) return true;
+    void* address = reinterpret_cast<void*>(cpu_mapping_hint);
+    if (sceKernelReserveVirtualRange(&address, SparseSlot * UnitBlocks, 0, SparseSlot) != 0) return false;
+    for (std::size_t i = 0; i < UnitBlocks; ++i) unit_physical[i] = -1;
+    unit_base = reinterpret_cast<std::uintptr_t>(address);
+    return true;
+}
+// A zeroed piece (its code, unit index + 1). From the fault handler too: no allocation, no lock but
+// the store's spin.
+bool UnitTake(std::uint32_t* code) noexcept {
+    if (unit_base == 0) return false;
+    for (unsigned tries = 0; tries < 4; ++tries) {
+        Spin(unit_lock);
+        std::size_t i = unit_hint;
+        while (i < unit_count && (unit_physical[i] < 0 || unit_used[i] == 0xffffffffu)) ++i;
+        if (i < unit_count) {
+            const unsigned bit = static_cast<unsigned>(__builtin_ctz(~unit_used[i]));
+            unit_used[i] |= 1u << bit;
+            unit_hint = i;
+            unit_lock.clear(std::memory_order_release);
+            *code = static_cast<std::uint32_t>(i * SubUnits + bit + 1);
+            std::memset(UnitView(*code), 0, SubUnit);
+            unit_live.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        unit_hint = unit_count;
+        unit_lock.clear(std::memory_order_release);
+        // Every block is full: one more from the pool (or the writers' reserve).
+        std::int64_t physical = -1;
+        if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !ReserveBlock(&physical)) return false;
+        Spin(unit_lock);
+        std::size_t free_index = 0;
+        while (free_index < UnitBlocks && unit_physical[free_index] >= 0) ++free_index;
+        const bool mapped = free_index < UnitBlocks && MapSlot(unit_base + free_index * SparseSlot, PROT_READ | PROT_WRITE, physical);
+        if (mapped) {
+            unit_physical[free_index] = physical;
+            unit_used[free_index] = 0;
+            unit_hint = std::min(unit_hint, free_index);
+            unit_count = std::max(unit_count, free_index + 1);
+            unit_held.fetch_add(SparseSlot, std::memory_order_relaxed);
+            guest_committed.fetch_add(SparseSlot, std::memory_order_relaxed);
+        }
+        unit_lock.clear(std::memory_order_release);
+        if (!mapped) {
+            if (sceKernelReleaseDirectMemory(physical, SparseSlot) != 0) std::abort();
+            return false;
+        }
+    }
+    return false;
+}
+// A piece goes back; a block with none left goes back to the pool.
+void UnitGive(std::uint32_t code) noexcept {
+    const std::size_t i = (code - 1) / SubUnits;
+    Spin(unit_lock);
+    unit_used[i] &= ~(1u << ((code - 1) % SubUnits));
+    unit_hint = std::min(unit_hint, i);
+    if (unit_used[i] == 0) {
+        // (read-only zeroes over the view: the system may refuse a no-access mapping)
+        if (!MapSlot(unit_base + i * SparseSlot, PROT_READ, zero_block) ||
+            sceKernelReleaseDirectMemory(unit_physical[i], SparseSlot) != 0)
+            std::abort();
+        unit_physical[i] = -1;
+        while (unit_count > 0 && unit_physical[unit_count - 1] < 0) --unit_count;
+        unit_held.fetch_sub(SparseSlot, std::memory_order_relaxed);
+        guest_committed.fetch_sub(SparseSlot, std::memory_order_relaxed);
+    }
+    unit_lock.clear(std::memory_order_release);
+    unit_live.fetch_sub(1, std::memory_order_relaxed);
+}
+bool MapUnits(std::uintptr_t at, std::size_t bytes, int protection, std::int64_t physical) noexcept {
+    void* address = reinterpret_cast<void*>(at);
+    return sceKernelMapDirectMemory(&address, bytes, protection, MAP_FIXED, physical, FinePage) == 0 &&
+           address == reinterpret_cast<void*>(at);
+}
+// The slot (its 2 MiB mapping taken away whole first: a large mapping is never split) mapped unit by
+// unit: `codes[u]` read-write where it is set, the zero block read-only elsewhere. False: nothing is
+// mapped at the slot.
+bool MapSub(std::uintptr_t at, const std::uint32_t (&codes)[SubUnits]) noexcept {
+    if (munmap(reinterpret_cast<void*>(at), SparseSlot) != 0) std::abort();
+    for (std::size_t unit = 0; unit < SubUnits;) {
+        std::size_t end = unit + 1;
+        if (codes[unit] == 0)
+            while (end < SubUnits && codes[end] == 0) ++end;
+        const bool ok = codes[unit] == 0 ? MapUnits(at + unit * SubUnit, (end - unit) * SubUnit, PROT_READ, zero_block + std::int64_t(unit * SubUnit))
+                                         : MapUnits(at + unit * SubUnit, SubUnit, PROT_READ | PROT_WRITE, UnitPhysical(codes[unit]));
+        if (!ok) return false;
+        unit = end;
+    }
+    return true;
+}
+#else
+bool UnitStart() noexcept { return false; }
+bool UnitTake(std::uint32_t*) noexcept { return false; }
+void UnitGive(std::uint32_t) noexcept {}
+#endif
+
+// Zero -> Sub: the written unit gets a piece of its own (the slot is locked).
+bool PromoteZeroSub(SparseRange& range, std::size_t slot, std::size_t unit) noexcept {
+#ifdef PS5_NATIVE
+    DropSlotAliases(range, slot);
+    std::uint32_t codes[SubUnits] = {};
+    if (!UnitTake(&codes[unit])) return false;
+    const std::uintptr_t at = SlotAddress(range, slot);
+    if (!MapSub(at, codes)) {
+        if (!MapSlot(at, PROT_READ, zero_block)) std::abort();
+        UnitGive(codes[unit]);
+        sub_failures.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    range.sub[slot] = 1u << unit;
+    range.sub_unit[slot * SubUnits + unit] = codes[unit];
+    range.physical[slot] = -1;
+    sub_made.fetch_add(1, std::memory_order_relaxed);
+    return true;
+#else
+    (void)range, (void)slot, (void)unit;
+    return false;
+#endif
+}
+// Sub: a unit of zeroes written (the slot is locked). Already backed: nothing to do.
+bool BackSubUnit(SparseRange& range, std::size_t slot, std::size_t unit) noexcept {
+#ifdef PS5_NATIVE
+    if (range.sub[slot] & (1u << unit)) return true;
+    std::uint32_t code = 0;
+    if (!UnitTake(&code)) return false;
+    if (!MapUnits(SlotAddress(range, slot) + unit * SubUnit, SubUnit, PROT_READ | PROT_WRITE, UnitPhysical(code))) {
+        UnitGive(code); // the unit still shows the zero block
+        sub_failures.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    range.sub[slot] |= 1u << unit;
+    range.sub_unit[slot * SubUnits + unit] = code;
+    sub_backed.fetch_add(1, std::memory_order_relaxed);
+    return true;
+#else
+    (void)range, (void)slot, (void)unit;
+    return false;
+#endif
+}
+// Sub: a backed unit shows the zero block again and its piece goes back (the slot is locked; the
+// unit holds only zeroes, fenced).
+void GiveSubUnit(SparseRange& range, std::size_t slot, std::size_t unit) noexcept {
+#ifdef PS5_NATIVE
+    if (!MapUnits(SlotAddress(range, slot) + unit * SubUnit, SubUnit, PROT_READ, zero_block + std::int64_t(unit * SubUnit)))
+        std::abort();
+    UnitGive(std::exchange(range.sub_unit[slot * SubUnits + unit], 0u));
+    range.sub[slot] &= ~(1u << unit);
+    sub_given.fetch_add(1, std::memory_order_relaxed);
+#else
+    (void)range, (void)slot, (void)unit;
+#endif
+}
+// Sub -> Zero (the slot is locked).
+void ReturnSub(SparseRange& range, std::size_t slot) noexcept {
+#ifdef PS5_NATIVE
+    if (!MapSlot(SlotAddress(range, slot), PROT_READ, zero_block)) std::abort();
+    for (std::size_t unit = 0; unit < SubUnits; ++unit)
+        if (range.sub[slot] & (1u << unit)) UnitGive(std::exchange(range.sub_unit[slot * SubUnits + unit], 0u));
+#endif
+    range.sub[slot] = 0;
+    range.physical[slot] = -1;
+}
+// Sub -> Own: one block of 2 MiB again, a copy of what the slot shows (the slot is locked).
+bool PromoteSub(SparseRange& range, std::size_t slot) noexcept {
+#ifdef PS5_NATIVE
+    DropSlotAliases(range, slot);
+    const std::uintptr_t at = SlotAddress(range, slot);
+    std::int64_t physical = -1;
+    if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !ReserveBlock(&physical)) return false;
+    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
+    if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, physical, SparseSlot) != 0) {
+        (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
+        return false;
+    }
+    // Fenced while it is copied: a write meanwhile faults and waits for the slot.
+    if (mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_READ) != 0) std::abort();
+    std::memcpy(view, reinterpret_cast<const void*>(at), SparseSlot);
+    if (munmap(view, SparseSlot) != 0) std::abort();
+    if (!MapSlot(at, PROT_READ | PROT_WRITE, physical)) {
+        for (std::size_t unit = 0; unit < SubUnits; ++unit)
+            if ((range.sub[slot] & (1u << unit)) &&
+                mprotect(reinterpret_cast<void*>(at + unit * SubUnit), SubUnit, PROT_READ | PROT_WRITE) != 0)
+                std::abort();
+        (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
+        return false;
+    }
+    for (std::size_t unit = 0; unit < SubUnits; ++unit)
+        if (range.sub[slot] & (1u << unit)) UnitGive(std::exchange(range.sub_unit[slot * SubUnits + unit], 0u));
+    range.sub[slot] = 0;
+    range.physical[slot] = physical;
+    guest_committed.fetch_add(SparseSlot, std::memory_order_relaxed);
+    sub_whole.fetch_add(1, std::memory_order_relaxed);
+    return true;
+#else
+    (void)range, (void)slot;
+    return false;
+#endif
+}
+
 // ---- The changes of a slot (the slot is locked) ----
 
 // Zero -> Own: a zeroed block of its own, read-write.
@@ -490,6 +762,10 @@ void ReturnSlot(SparseRange& range, std::size_t slot) noexcept {
 #endif
         ForgetPacked(slot);
         range.physical[slot] = -1;
+        return;
+    }
+    if (state == SlotSub) {
+        ReturnSub(range, slot);
         return;
     }
     if (state == SlotFine) {
@@ -702,8 +978,9 @@ bool ServiceCommit(SparseRange& range, std::size_t slot) noexcept {
     const std::uint8_t state = SlotState(range, slot);
     const bool ok = state == SlotZero ? PromoteZero(range, slot)
                   : state == SlotFine ? PromoteFine(range, slot)
-                  : state == SlotPacked ? UnpackSlot(range, slot) : true;
-    UnlockSlot(range, slot, ok && (state == SlotZero || state == SlotFine || state == SlotPacked) ? SlotOwn : state);
+                  : state == SlotPacked ? UnpackSlot(range, slot)
+                  : state == SlotSub ? PromoteSub(range, slot) : true;
+    UnlockSlot(range, slot, ok && (state == SlotZero || state == SlotFine || state == SlotPacked || state == SlotSub) ? SlotOwn : state);
     return ok;
 }
 
@@ -917,12 +1194,19 @@ bool HandleGuestWriteFault(void* fault) noexcept {
         UnlockSlot(*range, slot, state);
         return true;
     }
+    // Zero and Sub slots back the written 64 KiB unit only (SubEnabled); they stay (become) Sub.
+    const std::size_t unit = (address - SlotAddress(*range, slot)) % SparseSlot / SubUnit;
+    const bool sub = range->sub != nullptr && (state == SlotSub || (state == SlotZero && SubEnabled()));
+    // A write fault on a unit that is backed and writable has nothing to change (counted as a repeat).
+    const bool unchanged = state == SlotSub && (range->sub[slot] & (1u << unit));
     const auto promote = [&]() noexcept {
         bool done = true;
-        if (state == SlotFine) {
+        if (state == SlotSub) {
+            done = BackSubUnit(*range, slot, unit);
+        } else if (state == SlotFine) {
             done = PromoteFine(*range, slot);
         } else if (state == SlotZero) {
-            done = PromoteZero(*range, slot);
+            done = sub ? PromoteZeroSub(*range, slot, unit) : PromoteZero(*range, slot);
             if (done) {
                 counters.promotions.fetch_add(1, std::memory_order_relaxed);
                 NoteWriter();
@@ -937,12 +1221,12 @@ bool HandleGuestWriteFault(void* fault) noexcept {
     };
     bool ok = promote();
     if (!ok) ok = WaitForBlock(promote);
-    UnlockSlot(*range, slot, ok ? SlotOwn : state);
+    UnlockSlot(*range, slot, ok ? (sub ? SlotSub : SlotOwn) : state);
     if (!ok) {
         counters.failures.fetch_add(1, std::memory_order_relaxed);
         Refused(address, 2, state);
         Note("EDEN_CRAM out of memory: a written slot of the guest's memory found no block\n");
-    } else if (state != SlotOwn) {
+    } else if (state != SlotOwn && !unchanged) {
         // The slot was made writable. A game that writes one place each time its slot was given
         // back (cleared, freed or scanned) faults there again and again over a session, each time
         // with something to do: counted as repeats, the 17th such write ended the game after
@@ -1014,6 +1298,15 @@ bool AddStates(SparseRange& range) noexcept {
         delete[] fine;
         delete[] fine_after;
         return false;
+    }
+    // Sub slots: only where the unit store started (else every slot is promoted whole).
+    if (SubEnabled() && UnitStart()) {
+        range.sub = new (std::nothrow) std::uint32_t[slots]();
+        range.sub_unit = range.sub ? new (std::nothrow) std::uint32_t[slots * SubUnits]() : nullptr;
+        if (range.sub_unit == nullptr) {
+            delete[] range.sub;
+            range.sub = nullptr;
+        }
     }
     range.fine = fine;
     range.fine_after = fine_after;
@@ -1120,6 +1413,111 @@ bool ScanFine(SparseRange& range, std::size_t slot) noexcept {
     if (!fined) Unfence(at);
     UnlockSlot(range, slot, fined ? SlotFine : SlotOwn);
     return fined;
+}
+
+// An Own slot with many units of zeroes becomes Sub: its other units are copied into pieces of their
+// own and its block goes back. A racy count first, then the count again fenced. A slot made Own again
+// (PromoteSub) waits as a Fine slot made whole does (fine_after).
+bool ScanSub(SparseRange& range, std::size_t slot) noexcept {
+#ifdef PS5_NATIVE
+    const std::uintptr_t at = SlotAddress(range, slot);
+    if (range.sub == nullptr || counters.passes.load(std::memory_order_relaxed) < range.fine_after[slot]) return false;
+    std::size_t zeros = 0;
+    for (std::size_t unit = 0; unit < SubUnits; ++unit) zeros += UnitZero(at + unit * SubUnit);
+    if (zeros < SubMinZeroUnits()) return false;
+    LockSlot(range, slot);
+    if (SlotState(range, slot) != SlotOwn) {
+        UnlockSlot(range, slot, SlotState(range, slot));
+        return false;
+    }
+    Fence(at);
+    std::uint32_t codes[SubUnits] = {};
+    std::uint32_t mask = 0;
+    zeros = 0;
+    for (std::size_t unit = 0; unit < SubUnits; ++unit) {
+        if (UnitZero(at + unit * SubUnit)) ++zeros;
+        else mask |= 1u << unit;
+    }
+    if (zeros == SubUnits) {
+        ReturnSlot(range, slot);
+        UnlockSlot(range, slot, SlotZero);
+        counters.returns_scan.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    bool ok = zeros >= SubMinZeroUnits();
+    for (std::size_t unit = 0; unit < SubUnits && ok; ++unit)
+        if (mask & (1u << unit)) {
+            ok = UnitTake(&codes[unit]);
+            if (ok) std::memcpy(UnitView(codes[unit]), reinterpret_cast<const void*>(at + unit * SubUnit), SubUnit);
+        }
+    const std::int64_t whole = range.physical[slot];
+    if (ok && !MapSub(at, codes)) {
+        // The slot shows its block again, as it was (fenced: read-only until unfenced below).
+        if (!MapSlot(at, PROT_READ, whole)) std::abort();
+        ok = false;
+        sub_failures.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!ok) {
+        for (const std::uint32_t code : codes)
+            if (code != 0) UnitGive(code);
+        Unfence(at);
+        UnlockSlot(range, slot, SlotOwn);
+        return false;
+    }
+    if (sceKernelReleaseDirectMemory(whole, SparseSlot) != 0) std::abort();
+    guest_committed.fetch_sub(SparseSlot, std::memory_order_relaxed);
+    range.physical[slot] = -1;
+    range.sub[slot] = mask;
+    for (std::size_t unit = 0; unit < SubUnits; ++unit) range.sub_unit[slot * SubUnits + unit] = codes[unit];
+    sub_from_own.fetch_add(1, std::memory_order_relaxed);
+    UnlockSlot(range, slot, SlotSub);
+    return true;
+#else
+    (void)range, (void)slot;
+    return false;
+#endif
+}
+
+// A Sub slot: its backed units that hold only zeroes go back (fenced while looked at again); with none
+// left it is Zero, with SubWholeUnits or more backed it is made Own.
+void ScanSubSlot(SparseRange& range, std::size_t slot) noexcept {
+#ifdef PS5_NATIVE
+    const std::uintptr_t at = SlotAddress(range, slot);
+    const std::uint32_t seen = range.sub[slot]; // racy: a hint
+    std::uint32_t zero = 0;
+    for (std::size_t unit = 0; unit < SubUnits; ++unit)
+        if ((seen & (1u << unit)) && UnitZero(at + unit * SubUnit)) zero |= 1u << unit;
+    const bool whole = static_cast<std::size_t>(__builtin_popcount(seen)) >= SubWholeUnits();
+    if (zero == 0 && !whole) return;
+    LockSlot(range, slot);
+    if (SlotState(range, slot) != SlotSub) {
+        UnlockSlot(range, slot, SlotState(range, slot));
+        return;
+    }
+    DropSlotAliases(range, slot);
+    for (std::size_t unit = 0; unit < SubUnits; ++unit) {
+        if (!(zero & range.sub[slot] & (1u << unit))) continue;
+        const std::uintptr_t unit_at = at + unit * SubUnit;
+        if (mprotect(reinterpret_cast<void*>(unit_at), SubUnit, PROT_READ) != 0) std::abort();
+        if (UnitZero(unit_at)) GiveSubUnit(range, slot, unit);
+        else if (mprotect(reinterpret_cast<void*>(unit_at), SubUnit, PROT_READ | PROT_WRITE) != 0) std::abort();
+    }
+    std::uint8_t to = SlotSub;
+    if (range.sub[slot] == 0) {
+        ReturnSub(range, slot);
+        counters.returns_scan.fetch_add(1, std::memory_order_relaxed);
+        to = SlotZero;
+    } else if (static_cast<std::size_t>(__builtin_popcount(range.sub[slot])) >= SubWholeUnits() && PromoteSub(range, slot)) {
+        // Made whole: it may be Sub again after the same back-off as a Fine slot made whole.
+        const unsigned times = std::min<unsigned>(((range.fine[slot] >> 8) & 0xf) + 1, FineBackoffMax);
+        range.fine[slot] = static_cast<std::uint16_t>(times << 8);
+        range.fine_after[slot] = static_cast<std::uint32_t>(counters.passes.load(std::memory_order_relaxed)) + (1u << times);
+        to = SlotOwn;
+    }
+    UnlockSlot(range, slot, to);
+#else
+    (void)range, (void)slot;
+#endif
 }
 
 // Two slots of the same bytes show one block (the console; the host only counts them).
@@ -1528,10 +1926,13 @@ void ScanPass(SparseRange& range) noexcept {
     const std::size_t slots = (range.end - range.begin.load(std::memory_order_relaxed)) / SparseSlot;
     std::vector<std::pair<std::uint64_t, std::size_t>> samples;
     for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (SlotState(range, slot) == SlotSub) ScanSubSlot(range, slot);
         if (SlotState(range, slot) != SlotOwn) continue;
         const std::uintptr_t at = SlotAddress(range, slot);
         if (AllZero(at)) { // a read without the lock: only a hint, checked again fenced
             if (ScanZero(range, slot)) counters.returns_scan.fetch_add(1, std::memory_order_relaxed);
+        } else if (range.sub != nullptr) {
+            (void)ScanSub(range, slot); // (in place of Fine: a write to a Sub slot backs 64 KiB, not 2 MiB)
         } else if (fine_requested.load(std::memory_order_relaxed) && ScanFine(range, slot)) {
             // now Fine
         } else if (dedup_requested.load(std::memory_order_relaxed)) {
@@ -1566,11 +1967,15 @@ void ScanPass(SparseRange& range) noexcept {
 
 void ServiceReport(SparseRange& range, const char* when) noexcept {
     const std::size_t slots = (range.end - range.begin.load(std::memory_order_relaxed)) / SparseSlot;
-    std::size_t own = 0, shared = 0, fine = 0, fine_kept = 0;
+    std::size_t own = 0, shared = 0, fine = 0, fine_kept = 0, sub = 0, sub_units = 0;
     for (std::size_t slot = 0; slot < slots; ++slot) {
         const auto state = SlotState(range, slot);
         own += state == SlotOwn;
         shared += state == SlotShared;
+        if (state == SlotSub) {
+            ++sub;
+            sub_units += static_cast<std::size_t>(__builtin_popcount(range.sub[slot]));
+        }
         if (state == SlotFine) {
             ++fine;
             fine_kept += FineKept(range, slot);
@@ -1582,7 +1987,7 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         "returns_clear=%llu returns_free=%llu returns_scan=%llu dedup=%llu reserve_used=%llu failures=%llu "
         "passes=%llu scan_ms=%llu fine=%zu fine_held=%zuMiB fined=%llu unfined=%llu fine_failures=%llu "
         "reserve=%zuMiB host_transferred=%lluMiB freed_parts=%llu freed_parts_cleared=%lluMiB\n",
-        when, guest_committed.load(std::memory_order_relaxed) >> 20, own, shared, slots - own - shared - fine,
+        when, guest_committed.load(std::memory_order_relaxed) >> 20, own, shared, slots - own - shared - fine - sub,
         (unsigned long long)counters.faults.load(), (unsigned long long)counters.promotions.load(),
         (unsigned long long)counters.copies.load(), (unsigned long long)counters.waits.load(),
         (unsigned long long)counters.returns_clear.load(), (unsigned long long)counters.returns_free.load(),
@@ -1595,6 +2000,18 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         (unsigned long long)counters.host_reserve_used.load() * (SparseSlot >> 20),
         (unsigned long long)freed_part_calls.load(), (unsigned long long)(freed_part_bytes.load() >> 20));
     if (length > 0) Report(line);
+    if (range.sub != nullptr) {
+        // units: what Sub slots back; store: the 2 MiB blocks the pieces come from (in held).
+        const int sub_length = std::snprintf(line, sizeof(line),
+            "EDEN_CRAM_SUB %s slots=%zu units=%zuMiB store=%zuMiB pieces=%lluMiB made=%llu backed=%llu given=%llu "
+            "whole=%llu from_own=%llu failures=%llu own=%zuMiB\n",
+            when, sub, sub_units * SubUnit >> 20, unit_held.load(std::memory_order_relaxed) >> 20,
+            (unsigned long long)(unit_live.load(std::memory_order_relaxed) * SubUnit >> 20),
+            (unsigned long long)sub_made.load(), (unsigned long long)sub_backed.load(), (unsigned long long)sub_given.load(),
+            (unsigned long long)sub_whole.load(), (unsigned long long)sub_from_own.load(), (unsigned long long)sub_failures.load(),
+            own * (SparseSlot >> 20));
+        if (sub_length > 0) Report(line);
+    }
     // Who wrote the slots that were promoted: the largest places (offsets in the app's image).
     struct Top { const WriterSite* site; std::uint64_t count; } top[10]{};
     for (const WriterSite& site : writer_sites) {
@@ -1784,6 +2201,47 @@ bool ServiceAvailable() noexcept {
                         step = "fine-write";
                 }
             }
+            if (std::strcmp(step, "ok") == 0 && range->sub != nullptr) {
+                // Sub: slot 1 written at unit 5 backs that unit only; unit 6 next; unit 6 zeroed again
+                // goes back on a scan; then made Own with every byte where it was, and Sub again.
+                // A failure here turns Sub slots off, not the service.
+                const char* sub_step = "ok";
+                LockSlot(*range, 1);
+                if (SlotState(*range, 1) != SlotZero) ReturnSlot(*range, 1);
+                UnlockSlot(*range, 1, SlotZero);
+                auto* unit5 = reinterpret_cast<volatile std::uint64_t*>(static_cast<std::uint8_t*>(base) + SparseSlot + 5 * SubUnit + 8);
+                auto* unit6 = reinterpret_cast<volatile std::uint64_t*>(static_cast<std::uint8_t*>(base) + SparseSlot + 6 * SubUnit);
+                *unit5 = 0x5ab5ab5ab5ab5ull;
+                if (SlotState(*range, 1) != SlotSub || range->sub[1] != (1u << 5) || *unit5 != 0x5ab5ab5ab5ab5ull || *word != 0)
+                    sub_step = "sub";
+                else {
+                    *unit6 = 6;
+                    if (range->sub[1] != (3u << 5) || *unit6 != 6 || *unit5 != 0x5ab5ab5ab5ab5ull) sub_step = "sub-second";
+                    else {
+                        *unit6 = 0;
+                        ScanSubSlot(*range, 1);
+                        if (range->sub[1] != (1u << 5) || SlotState(*range, 1) != SlotSub || *unit5 != 0x5ab5ab5ab5ab5ull)
+                            sub_step = "sub-give";
+                        else {
+                            LockSlot(*range, 1);
+                            const bool whole = PromoteSub(*range, 1);
+                            UnlockSlot(*range, 1, whole ? SlotOwn : SlotSub);
+                            range->fine_after[1] = 0;
+                            if (!whole || *unit5 != 0x5ab5ab5ab5ab5ull || *unit6 != 0) sub_step = "sub-whole";
+                            else if ((*word = 21, *word != 21)) sub_step = "sub-own-write";
+                            else if (!ScanSub(*range, 1) || SlotState(*range, 1) != SlotSub || range->sub[1] != ((1u << 5) | 1u) ||
+                                     *unit5 != 0x5ab5ab5ab5ab5ull || *word != 21)
+                                sub_step = "sub-from-own";
+                        }
+                    }
+                }
+                if (std::strcmp(sub_step, "ok") != 0) {
+                    sub_state.store(2, std::memory_order_release);
+                    char sub_line[96];
+                    const int n = std::snprintf(sub_line, sizeof(sub_line), "EDEN_CRAM_SUB off: the check failed at %s\n", sub_step);
+                    if (n > 0) Report(sub_line);
+                }
+            }
             for (std::size_t slot = 0; slot < 2; ++slot)
                 if (SlotState(*range, slot) != SlotZero) {
                     LockSlot(*range, slot);
@@ -1832,9 +2290,9 @@ void ServiceStart(SparseRange& range) noexcept {
     keeper = std::thread(ReserveKeeper);
 #endif
     char line[128];
-    const int length = std::snprintf(line, sizeof(line), "EDEN_CRAM on: scan=%d dedup=%d fine=%d reserve=%zuMiB\n",
+    const int length = std::snprintf(line, sizeof(line), "EDEN_CRAM on: scan=%d dedup=%d fine=%d sub=%d reserve=%zuMiB\n",
                                      scan_requested.load() ? 1 : 0, dedup_requested.load() ? 1 : 0,
-                                     fine_requested.load() ? 1 : 0,
+                                     fine_requested.load() ? 1 : 0, range.sub != nullptr ? 1 : 0,
                                      reserve_count.load() * (SparseSlot >> 20));
     if (length > 0) Report(line);
 }
@@ -1866,7 +2324,11 @@ void ReleaseServiceBlocks(SparseRange& range) noexcept {
     for (std::size_t slot = 0; slot < slots; ++slot) {
         DropSlotAliases(range, slot);
         const auto state = SlotState(range, slot);
-        if (state == SlotFine) {
+        if (state == SlotSub) {
+            for (std::size_t unit = 0; unit < SubUnits; ++unit)
+                if (range.sub[slot] & (1u << unit)) UnitGive(std::exchange(range.sub_unit[slot * SubUnits + unit], 0u));
+            range.sub[slot] = 0;
+        } else if (state == SlotFine) {
             const std::size_t kept = FineKept(range, slot);
             if (kept != 0 && sceKernelReleaseDirectMemory(range.physical[slot], kept * FinePage) != 0) std::abort();
             guest_committed.fetch_sub(kept * FinePage, std::memory_order_relaxed);
@@ -2027,6 +2489,26 @@ void SetGuestMemoryFine(bool on) noexcept {
     fine_requested.store(on, std::memory_order_relaxed);
 }
 
+// Zeroes [offset, end) of a Sub slot (locked, `offset` and `end` inside it): units it covers whole go
+// back, backed units it covers in part are written; units of zeroes are left alone (a write there
+// would back them).
+void ZeroSubPart(SparseRange& range, std::size_t slot, std::uint64_t offset, std::uint64_t end) noexcept {
+    const std::uintptr_t at = SlotAddress(range, slot);
+    for (std::uint64_t cursor = offset; cursor < end;) {
+        const std::size_t unit = static_cast<std::size_t>(cursor % SparseSlot / SubUnit);
+        const std::uint64_t unit_end = std::min<std::uint64_t>(end, (cursor / SubUnit + 1) * SubUnit);
+        if (range.sub[slot] & (1u << unit)) {
+            if (cursor % SubUnit == 0 && unit_end - cursor == SubUnit) {
+                DropSlotAliases(range, slot);
+                GiveSubUnit(range, slot, unit);
+            } else {
+                std::memset(reinterpret_cast<void*>(at + cursor % SparseSlot), 0, static_cast<std::size_t>(unit_end - cursor));
+            }
+        }
+        cursor = unit_end;
+    }
+}
+
 // The guest's kernel hands pages out: they are committed now only without the service.
 void CommitGuestMemoryOnHandOut(std::uint64_t offset, std::size_t bytes) noexcept {
     SparseRange* const range = guest_range.load(std::memory_order_acquire);
@@ -2057,6 +2539,19 @@ void ClearGuestMemory(std::uint8_t* at, std::uint64_t offset, std::size_t bytes,
                 counters.returns_clear.fetch_add(1, std::memory_order_relaxed);
             }
             UnlockSlot(*range, slot, SlotZero);
+        } else if (SlotState(*range, slot) == SlotSub) {
+            LockSlot(*range, slot);
+            std::uint8_t state = SlotState(*range, slot);
+            if (state == SlotSub) {
+                ZeroSubPart(*range, slot, cursor, piece_end);
+                if (range->sub[slot] == 0) {
+                    ReturnSub(*range, slot);
+                    state = SlotZero;
+                }
+            }
+            UnlockSlot(*range, slot, state);
+            if (state != SlotSub && state != SlotZero)
+                std::memset(at + (cursor - offset), 0, static_cast<std::size_t>(piece_end - cursor));
         } else if (SlotState(*range, slot) != SlotZero) {
             std::memset(at + (cursor - offset), 0, static_cast<std::size_t>(piece_end - cursor));
         }
@@ -2070,8 +2565,17 @@ void FillGuestMemory(std::uint8_t* at, int fill, std::size_t bytes) noexcept {
     if (range != nullptr && range->promote && fill == 0) {
         const auto begin = range->begin.load(std::memory_order_relaxed);
         const auto address = reinterpret_cast<std::uintptr_t>(at);
-        if (address >= begin && address < range->end && SlotState(*range, (address - begin) / SparseSlot) == SlotZero)
-            return;
+        if (address >= begin && address < range->end) {
+            const std::size_t slot = (address - begin) / SparseSlot;
+            const auto state = SlotState(*range, slot);
+            if (state == SlotZero) return;
+            // A unit of zeroes of a Sub slot stays one (a racy look: a unit is backed only by a write,
+            // and the guest's kernel owns these pages now).
+            const std::size_t unit = (address - begin) % SparseSlot / SubUnit;
+            if (state == SlotSub && (address - begin) % SubUnit + bytes <= SubUnit &&
+                !(range->sub[slot] & (1u << unit)))
+                return;
+        }
     }
     std::memset(at, fill, bytes);
 }
@@ -2125,11 +2629,18 @@ void GuestMemoryFreedPart(std::uint64_t offset, std::size_t bytes) noexcept {
         const std::uint64_t slot_end = std::min<std::uint64_t>(end, (at / SparseSlot + 1) * SparseSlot);
         if (slot >= slots) break;
         LockSlot(*range, slot);
-        const std::uint8_t state = SlotState(*range, slot);
+        std::uint8_t state = SlotState(*range, slot);
         if (state == SlotOwn) {
             std::memset(reinterpret_cast<void*>(SlotAddress(*range, slot) + at % SparseSlot), 0,
                         static_cast<std::size_t>(slot_end - at));
             freed_part_bytes.fetch_add(slot_end - at, std::memory_order_relaxed);
+        } else if (state == SlotSub) {
+            ZeroSubPart(*range, slot, at, slot_end);
+            freed_part_bytes.fetch_add(slot_end - at, std::memory_order_relaxed);
+            if (range->sub[slot] == 0) {
+                ReturnSub(*range, slot);
+                state = SlotZero;
+            }
         }
         UnlockSlot(*range, slot, state);
         at = slot_end;
@@ -2148,6 +2659,7 @@ std::size_t GuestMemoryHeldIn(std::uint64_t offset, std::size_t bytes) noexcept 
         const auto state = SlotState(*range, slot);
         if (state == SlotOwn || state == SlotShared) held += SparseSlot;
         else if (state == SlotFine) held += FineKept(*range, slot) * FinePage;
+        else if (state == SlotSub) held += static_cast<std::size_t>(__builtin_popcount(range->sub[slot])) * SubUnit;
     }
     return held;
 }
@@ -2181,6 +2693,8 @@ bool AliasGuestSlot(std::uintptr_t backing, std::uintptr_t window_at, bool writa
     std::int64_t physical = -1;
     if (state == SlotOwn) {
         physical = range->physical[slot];
+    } else if (state == SlotSub) {
+        // ponytail: Sub slots stay off the 64-bit window (page-table path); show backed units' pieces if it matters.
     } else if (write) {
         *promote = true;
     } else if (state == SlotZero) {
@@ -2238,7 +2752,9 @@ bool AliasGuestPage(std::uintptr_t backing, std::uintptr_t at, std::uintptr_t re
     // promotes the slot first (the caller). A Fine slot keeps its pages apart: not shown.
     const std::size_t offset = backing - SlotAddress(*range, slot);
     std::int64_t physical = -1;
-    if (state == SlotOwn || (!write && state == SlotShared)) {
+    if (state == SlotSub) {
+        // not shown (AliasGuestSlot)
+    } else if (state == SlotOwn || (!write && state == SlotShared)) {
         physical = range->physical[slot] >= 0 ? range->physical[slot] + std::int64_t(offset) : -1;
     } else if (!write && state == SlotZero) {
         physical = zero_block + std::int64_t(offset);
