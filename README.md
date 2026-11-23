@@ -314,7 +314,7 @@ The file is `guest-memory.swap` in `/data/eglantineps5/cache/`. It exists only w
 - The file is never larger than 2 GiB and is not made when the storage has less than 8 GiB free.
 - Everything read back is checked against a hash taken when it was written.
 
-On a PS5 Pro, Mario Kart World wrote nothing in its first races and 2.3 GiB in a 30-minute session, which ends after 10 minutes without the file; The Legend of Zelda: Ocarina of Time wrote nothing.
+On a PS5 Pro, Mario Kart World wrote nothing in its first races and 2.3 to 2.8 GiB in a 30-minute session, which ends after 10 minutes without the file; The Legend of Zelda: Ocarina of Time wrote nothing.
 
 `"swap_file": false` under `"performance"` in the settings file switches it off for every game. The other limits are listed in [docs/GUEST-MEMORY-SWAP.md](docs/GUEST-MEMORY-SWAP.md), with what was measured.
 

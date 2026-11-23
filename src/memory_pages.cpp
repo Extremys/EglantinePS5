@@ -722,6 +722,46 @@ static void ReportSparseCommitFailure(const SparseRange& range, std::size_t slot
     Report(line);
 }
 
+} // namespace Common
+// The guest memory service gives memory back to the pool (guest_memory_service.inc; never waits
+// without end, so it may be asked with other locks held).
+extern "C" std::size_t eden_memory_recover_try(std::size_t bytes) noexcept;
+namespace Common {
+namespace {
+// A table's or the guest's next 2 MiB found the pool empty: memory is asked back and the commit
+// tried again, for up to 2 s, before it counts as failed. These commits were the one taker that
+// did not ask: 21 minutes into a Mario Kart World session a piece of the GPU's page tables found
+// 1 MiB free and ended the app, while the service had 1 GB of Idle slots to give and most of its
+// swap file's budget unused.
+template <typename Commit>
+bool CommitWithRecovery(Commit&& commit) noexcept {
+    // EDEN_SPARSE_COMMIT_TEST=N (a test of this path): the first try of every N-th commit counts
+    // as refused, so memory is asked back and the commit tried again with the pool as it is.
+    static const std::size_t test_every = [] {
+        const char* const value = std::getenv("EDEN_SPARSE_COMMIT_TEST");
+        return value != nullptr ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : std::size_t{0};
+    }();
+    static std::atomic<std::size_t> commits{0}, asked{0};
+    const bool refused = test_every != 0 && commits.fetch_add(1, std::memory_order_relaxed) % test_every == test_every - 1;
+    if (!refused && commit()) return true;
+    for (int tries = 0; tries < 100; ++tries) {
+        if (eden_memory_recover_try(8 * SparseSlot) == 0) {
+            const timespec pause{0, 20'000'000};
+            nanosleep(&pause, nullptr);
+        }
+        if (!commit()) continue;
+        // (Said the 1st, 2nd, 4th, 8th ... time.)
+        if (const std::size_t count = asked.fetch_add(1, std::memory_order_relaxed) + 1; (count & (count - 1)) == 0) {
+            char line[128];
+            const int length = std::snprintf(line, sizeof(line),
+                "EDEN_SPARSE_TABLES a commit found no memory and got it after asking (%zu so far, try %d)\n", count, tries + 1);
+            if (length > 0) Report(line);
+        }
+        return true;
+    }
+    return false;
+}
+} // namespace
 void CommitSparsePage(std::uintptr_t page) noexcept {
     SparseRange* range = SparseRangeOf(page);
     if (range == nullptr) return; // dense: already writable
@@ -730,23 +770,28 @@ void CommitSparsePage(std::uintptr_t page) noexcept {
     if (range->owned[slot].load(std::memory_order_acquire)) return;
     if (range->state != nullptr) {
         // A range with slot states commits under the slot's lock (guest_memory_service.inc).
-        if (!ServiceCommit(*range, slot)) {
+        if (!CommitWithRecovery([&]() noexcept { return ServiceCommit(*range, slot); })) {
             ReportSparseCommitFailure(*range, slot);
             Report("EDEN_SPARSE_TABLES commit failed: out of memory\n");
             std::abort();
         }
         return;
     }
-    const std::lock_guard lock{sparse_mutex};
-    if (range->owned[slot].load(std::memory_order_relaxed)) return;
-    if (!OwnSlot(begin + slot * SparseSlot, &range->physical[slot])) {
+    // (The lock is let go while memory is asked back.)
+    const bool committed = CommitWithRecovery([&]() noexcept {
+        const std::lock_guard lock{sparse_mutex};
+        if (range->owned[slot].load(std::memory_order_relaxed)) return true;
+        if (!OwnSlot(begin + slot * SparseSlot, &range->physical[slot])) return false;
+        (range->guest ? guest_committed : sparse_committed).fetch_add(SparseSlot, std::memory_order_relaxed);
+        range->owned[slot].store(true, std::memory_order_release);
+        return true;
+    });
+    if (!committed) {
         // Out of memory in the middle of a guest mapping: there is no table to continue with.
         ReportSparseCommitFailure(*range, slot);
         Report("EDEN_SPARSE_TABLES commit failed: out of memory\n");
         std::abort();
     }
-    (range->guest ? guest_committed : sparse_committed).fetch_add(SparseSlot, std::memory_order_relaxed);
-    range->owned[slot].store(true, std::memory_order_release);
 }
 
 // Eden gives back a table page once a guest unmapped all of it, and expects zeroes there

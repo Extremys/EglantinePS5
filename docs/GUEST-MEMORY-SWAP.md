@@ -7,8 +7,8 @@ settings file turns it off, as does `EDEN_SWAP=0` in `env.txt`.
 Mario Kart World's crashes turned out to have two causes, and the first is one no swap file can
 cover. Both are described under [Mario Kart World](#mario-kart-world-two-causes).
 
-In short, on a PS5 Pro: Mario Kart World, which ended early on every try, runs a 30-minute
-session at 30.5 FPS with 2.3 GiB written to the storage. Without the swap file the same
+In short, on a PS5 Pro: Mario Kart World, which ended early on every try, runs 30-minute
+sessions at 30 to 31 FPS with 2.3 to 2.8 GiB written to the storage. Without the swap file the same
 session ends after 10 minutes. Its first races (5 minutes) and Ocarina of Time write nothing.
 The numbers are under [Results](#results).
 
@@ -90,14 +90,14 @@ The console's internal drive is 825 GB to 2 TB of flash, depending on the model.
 publish its endurance. Consumer TLC drives of about 1 TB are commonly rated near 600 TBW; taking
 that as a guide, a console that reached the 8 GiB limit every single day would write 3.1 TB a
 year, about 0.5% of it. Of the sessions measured below only Mario Kart World's 30 minutes wrote
-gigabytes (2.3 GiB); its 5-minute sessions and Ocarina of Time wrote nothing.
+gigabytes (2.3 and 2.8 GiB); its 5-minute sessions and Ocarina of Time wrote nothing.
 
 ## How it is kept safe
 
 - The file is tested once (a page written and read back) before any slot goes to it.
 - A slot's 2 MiB are hashed when written. What is read back is checked against the hash before the
   game sees it. Data that does not match ends the session with a line in the log; it never reaches
-  the game. (19,253 slots were read back in the test runs kept; none failed.)
+  the game. (24,795 slots were read back in the test runs kept; none failed.)
 - A write that fails or is cut short (storage full, an I/O error) leaves the slot as it was, with
   its block, and ends swapping for the session.
 - No slot is ever readable half-written or half-read: a slot is locked while it changes, has no
@@ -206,6 +206,15 @@ World session on its own.
 7. **The packed store kept its blocks.** A block of the packed store went back only when all of its
    data had. Ten minutes into a session the store held 544 MiB of blocks for 282 MiB of data. Data
    in blocks less than half full now moves together (`StoreCompact`).
+8. **A taker that did not ask.** The emulator's sparse tables (the GPU's page tables among them)
+   and the guest's memory when it is handed out take their 2 MiB pieces in `CommitSparsePage`,
+   which ended the app at the first refusal. 21 minutes into a session a piece of the GPU's page
+   tables found 1 MiB free, with 1 GB of Idle slots and most of the swap budget unused (1 of the 4
+   thirty-minute sessions run after the keeper stopped writing to the file; while it wrote, it
+   kept more of the pool free). The commit now asks for memory back and is tried again for up to 2 s
+   (`CommitWithRecovery`, `memory_pages.cpp`; `EDEN_SPARSE_COMMIT_TEST=N` refuses the first try
+   of every N-th commit, to test that path: with 20, a 5-minute session ran at 35.0 FPS and each
+   refused commit had its memory at the next try). Two 30-minute sessions since then ran through.
 
 ## Results
 
@@ -219,10 +228,10 @@ is what went to the storage in the session.
 | | Runs | Ended early | FPS | Frames over 100 ms | Written |
 |---|---|---|---|---|---|
 | `main` | 1 (and 6 the day before) | all (this one after 48 s) | | | |
-| this branch | 3 | 0 | 34.4 to 35.5 | 0 to 1 | 0 |
+| this branch | 6 | 0 | 34.4 to 35.5 | 0 to 1 | 0 |
 | this branch, `EDEN_SWAP=0` | 2 | 0 | 34.1 to 34.2 | 0 to 1 | 0 |
 
-No allocation was refused in any of the five: the first races fit once the render resolution
+No allocation was refused in any of the eight: the first races fit once the render resolution
 holds still, and the file is not written to.
 
 ### Mario Kart World, 30 minutes
@@ -233,33 +242,41 @@ holds still, and the file is not written to.
 | the keeper writes, copies ahead (as first built) | ran | 30.8 | 116 | 11.1 s | 3,429 MiB | 2,139 | 1,594 (75%) |
 | + the count of reuse, last resort | ran | 30.9 | 111 | 7.5 s | 3,762 MiB | 2,326 | 1,630 (70%) |
 | on request only, no copies | ran | 30.7 | 116 | 5.0 s | 2,757 MiB | 1,705 | 948 (56%) |
-| + only what the pool lacks (this branch) | ran | 30.5 | 129 | 4.2 s | 2,287 MiB | 1,414 | 546 (39%) |
+| + only what the pool lacks, 3 runs | 2 ran; 1 ended at 21:14 (a table's commit, see above) | 30.5, 31.2 | 129, 124 | 4.2 s, 4.8 s | 2,287 and 2,765 MiB | 1,414, 1,717 | 546 (39%), 896 (52%) |
+| + commits that ask (this branch), 2 runs | ran | 30.6, 30.8 | 148, 128 | 5.7 s, 5.2 s | 2,728 and 2,490 MiB | 1,681, 1,533 | 864 (51%), 708 (46%) |
 
-A long session of this game needs more than the pool holds: at the end of the last run 1.5 GB
-of its memory had their bytes in the file. Most of what it can give up is memory it reuses,
+A long session of this game needs more than the pool holds: at the end of the last four runs
+1.5 GB of its memory had their bytes in the file. Most of what it can give up is memory it reuses,
 which is why so many slots are dropped by the game's own next write however they are chosen.
 What the choices above changed is how much is written for the same 30 minutes; the frame rate
-is the same in all of them. In the last run 450 MiB had been written after 21 minutes. The rest
-went at two loads, 580 MiB at 22 minutes and 1,250 MiB in the last three: a track's textures
-(the 560 MiB array and a 128 MiB staging buffer among them) found the pool empty and nothing
-left to take but memory the game reuses (996 slots as a last resort).
+is the same in all of them. Writing on request only is what made the difference; taking only
+what the pool lacks shows no effect of its own beyond the 0.5 GiB that lie between runs of the
+same build. In the first run of that row 450 MiB had been written after 21 minutes. The rest went at two loads, 580 MiB at 22 minutes and
+1,250 MiB in the last three: a track's textures (the 560 MiB array and a 128 MiB staging buffer
+among them) found the pool empty and nothing left to take but memory the game reuses (996 to
+1,136 slots as a last resort in the four runs, two thirds of the slots they wrote).
 `EDEN_SWAP_LAST_RESORT=0` leaves such requests empty-handed instead; some allocations can do
 without (an image is not made), others end the session, as the run without the file shows.
 
-The budget never refused a write in that run. At this rate the session's limit (4 GiB) is
-reached after about 50 minutes of Mario Kart World, and the day's (8 GiB) by two long sessions;
-after that nothing more is written and the game runs as it does with `EDEN_SWAP=0`.
+The budget never refused a write in these runs. At this rate the session's limit (4 GiB) is
+reached after about 45 minutes of Mario Kart World, and the day's (8 GiB) by two such sessions.
+When the budget is used up the session ends the way it does without the file, at its next
+large need. With the session's limit set to 512 MiB for a test, the limit was reached 13.5
+minutes in (510 MiB written), 104,469 slots were refused from then on, and the session ended
+three and a half minutes later, out of device memory at a load, with 1.1 GB of Idle slots that
+could no longer be written. A longer Mario Kart World session needs a higher
+`EDEN_SWAP_SESSION_MIB` (and `EDEN_SWAP_DAY_MIB`), at about 85 MiB a minute.
 
 ### The Legend of Zelda: Ocarina of Time
 
 | | Runs | FPS | Frames over 100 ms | Written |
 |---|---|---|---|---|
-| this branch, 3 minutes | 3 | 33.5 to 34.1 | 0 | 0 |
+| this branch, 3 minutes | 6 | 33.5 to 34.2 | 0 | 0 |
 
 The pool gets short (its largest free block goes down to 0.9 GB, and 2.9 GB of the game's memory
 sit Idle), no allocation is refused, and nothing is written but the test page. `main` ran the
 same scene at 33.2 and 33.7 FPS the same night (2 runs; by the game's frames, which gives 33.6
-to 34.1 for the three runs above).
+to 34.2 for the six runs above).
 
 ### Donkey Kong Bananza
 
@@ -283,7 +300,7 @@ this mode: it will reach the budget's limits sooner than with PS5 Pro memory.
 
 ### What the tests wrote to this console
 
-49.4 GiB in two days (the ledger's `written_ever` after the last run), most of it by the
+58.6 GiB in two days (the ledger's `written_ever` after the last run), most of it by the
 variants that wrote ahead of need and by the 30-minute sessions. The tests ran with the day's
 limit raised (`EDEN_SWAP_DAY_MIB=65536`); with the default the day's 8 GiB would have ended
 the writing on both days.
@@ -331,6 +348,10 @@ many a later write dropped; then all slots that hold data, by the same count.
 swap_written=… candidates=…` is one request for memory back after a failed allocation: what was
 asked, what the pool had free then, what went back to the pool from slots and from the service's
 idle blocks, how much of it by way of the file, and how many Idle slots there were to take.
+
+`EDEN_SPARSE_TABLES a commit found no memory and got it after asking (N so far, try T)` says that
+a table's or the guest's next 2 MiB found the pool empty and had memory given back (printed the
+1st, 2nd, 4th, 8th ... time).
 
 `EDEN_NX2_TC_SHAPES=1` (with `EDEN_NX2_TC_LOG=1`) lists the shapes of the images the texture cache
 made in each 600 frames. `EDEN_NX2_MEM_TRACE=1` now also prints the allocator's pressure counters,
