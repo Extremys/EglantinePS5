@@ -1288,6 +1288,16 @@ extern "C" void eden_guest_gpu_cached(const void* host, int delta) noexcept {
     }
 }
 
+// True when `host` lies in the guest's memory. A system call handed such a pointer gets EFAULT where
+// a unit is packed, on probation or shows the zero block read-only (the kernel does not run the
+// fault handler), so file I/O copies through a buffer of its own there (common/fs/file.h).
+extern "C" int eden_guest_memory_contains(const void* host) noexcept {
+    SparseRange* const range = guest_range.load(std::memory_order_acquire);
+    if (range == nullptr) return 0;
+    const auto at = reinterpret_cast<std::uintptr_t>(host);
+    return at >= range->begin.load(std::memory_order_relaxed) && at < range->end;
+}
+
 extern "C" unsigned eden_guest_memory_wanted(void) noexcept {
     return memory_waiters.load(std::memory_order_acquire);
 }
