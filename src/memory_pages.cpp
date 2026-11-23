@@ -34,6 +34,17 @@ extern "C" {
 [[gnu::weak]] int LZ4_compress_default(const char* source, char* dest, int source_size, int max_dest_size);
 [[gnu::weak]] int LZ4_decompress_safe(const char* source, char* dest, int compressed_size, int max_decompressed_size);
 [[gnu::weak]] int LZ4_compressBound(int input_size);
+// zstd for the guest memory service's 64 KiB units (guest_memory_service.inc, "Units"): the core
+// links it; absent in the host checks that build this file alone.
+struct ZSTD_CCtx_s;
+struct ZSTD_DCtx_s;
+[[gnu::weak]] ZSTD_CCtx_s* ZSTD_createCCtx(void);
+[[gnu::weak]] ZSTD_DCtx_s* ZSTD_createDCtx(void);
+[[gnu::weak]] std::size_t ZSTD_compressCCtx(ZSTD_CCtx_s* context, void* to, std::size_t capacity, const void* from,
+                                            std::size_t size, int level);
+[[gnu::weak]] std::size_t ZSTD_decompressDCtx(ZSTD_DCtx_s* context, void* to, std::size_t capacity, const void* from,
+                                              std::size_t size);
+[[gnu::weak]] unsigned ZSTD_isError(std::size_t code);
 }
 namespace Common::Compression {
 [[gnu::weak]] std::vector<std::uint8_t> CompressDataLZ4(const std::uint8_t* source, std::size_t source_size);

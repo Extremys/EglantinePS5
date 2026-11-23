@@ -1847,8 +1847,10 @@ static void CheckReadTrapAreas() {
 // numbered in eden_swap_check.
 extern "C" int eden_swap_check(const char* folder) noexcept;
 extern "C" int LZ4_versionNumber(void); // (a reference that links LZ4 in: the port's own are weak)
+extern "C" unsigned ZSTD_versionNumber(void); // (and zstd, for the slots in units)
 static void CheckSwapFile() {
     require(LZ4_versionNumber() > 0);
+    require(ZSTD_versionNumber() > 0);
     const char* const parent = std::getenv("TMPDIR");
     char folder[512];
     require(std::snprintf(folder, sizeof(folder), "%s/eden-swap-check-XXXXXX", parent != nullptr && *parent ? parent : "/tmp") <
@@ -1858,7 +1860,7 @@ static void CheckSwapFile() {
     if (failed != 0) std::fprintf(stderr, "Swap store: step %d failed\n", failed);
     require(failed == 0);
     require(rmdir(folder) == 0); // (the check removes its store)
-    std::printf("Swap store PASS: 62 steps\n");
+    std::printf("Swap store PASS: 66 steps\n");
 }
 
 int main(int argc, char** argv) {
