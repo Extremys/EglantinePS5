@@ -337,12 +337,10 @@ void FillReserve(std::size_t blocks = ReserveTarget()) noexcept {
 // World: every GPU hang came seconds after ~1.3 GB was packed). EDEN_CRAM_UNPACK_KEEP_MIB (default
 // 256, at most 512) sets how many are kept.
 std::size_t UnpackKeepTarget() noexcept {
-    static const std::size_t blocks = [] {
-        const char* value = std::getenv("EDEN_CRAM_UNPACK_KEEP_MIB");
-        const std::size_t mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 256;
-        return std::min(UnpackKeepBlocks, mib / (SparseSlot >> 20));
-    }();
-    return blocks;
+    // Read each time, like ReserveTarget: a game's own default is set when it launches.
+    const char* value = std::getenv("EDEN_CRAM_UNPACK_KEEP_MIB");
+    const std::size_t mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 256;
+    return std::min(UnpackKeepBlocks, mib / (SparseSlot >> 20));
 }
 bool KeepForUnpack(std::int64_t physical) noexcept {
     Spin(unpack_keep_lock);
@@ -1765,12 +1763,12 @@ bool ScanShare(SparseRange& range, std::size_t keep, std::size_t other) noexcept
 // to come without packing too (the race-load event), and the hangs with GPU threads waiting for
 // memory went with the unpack reserve (EDEN_CRAM_UNPACK_KEEP_MIB).
 bool PackEnabled() noexcept {
-    static const bool on = [] {
-        const char* value = std::getenv("EDEN_CRAM_PACK");
-        return (value == nullptr || value[0] != '0') && &LZ4_compress_default != nullptr &&
-               &LZ4_decompress_safe != nullptr && &LZ4_compressBound != nullptr;
-    }();
-    return on;
+    static const bool lz4 = &LZ4_compress_default != nullptr && &LZ4_decompress_safe != nullptr &&
+                            &LZ4_compressBound != nullptr;
+    // Read each time, like ReserveTarget: a game's own default is set when it launches
+    // (headless/main.cpp), after the service has started for the first guest range.
+    const char* value = std::getenv("EDEN_CRAM_PACK");
+    return lz4 && (value == nullptr || value[0] != '0');
 }
 constexpr std::size_t PackPerPass = 256;                       // 512 MiB of slots
 // EDEN_CRAM_PACK_BELOW_MIB / EDEN_CRAM_PACK_COLD_S: when packing starts (largest free block) and how long
