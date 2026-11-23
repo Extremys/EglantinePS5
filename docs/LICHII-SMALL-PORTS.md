@@ -1,7 +1,7 @@
 # Two small things from PS5_Lichii (November 2026)
 
 Read from PS5_Lichii at commit 5a424f7 (`docs/ps5/texture-cache.md`, `docs/ps5/levers.md`,
-`docs/ps5/gpu-thread.md`, `ps5/src/fast_mem.cpp`). Neither has run on the console here.
+`docs/ps5/gpu-thread.md`, `ps5/src/fast_mem.cpp`). Neither was measured on its own; the build with both ran on the console (`docs/LICHII-MEMORY-PLAN.md`, "The console runs").
 
 ## The driver's memory counted twice
 

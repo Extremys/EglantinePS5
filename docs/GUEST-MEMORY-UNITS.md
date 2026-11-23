@@ -5,8 +5,11 @@ Steps 2 and 3 of `docs/LICHII-MEMORY-PLAN.md`: what PS5_Lichii (mihawk,
 for the part of it nothing touches. `EDEN_CRAM_UNITS=0` in `env.txt` switches it off; a slot is
 then packed whole with LZ4 or sent whole to the swap store, as in PR #135.
 
-**Not run on the console yet.** `UnitsOut` and `UnitFill`, the parts that do not need the
-console's memory calls, are in the host check (`eden_swap_check`, steps 64 to 67).
+`UnitsOut` and `UnitFill`, the parts that do not need the console's memory calls, are in the host
+check (`eden_swap_check`, steps 64 to 67). On the console it ran in four sessions together with
+the rest of the plan (two half hours of Mario Kart World, Ocarina of Time, Donkey Kong Bananza):
+`docs/LICHII-MEMORY-PLAN.md`, "The console runs", has the numbers. Mario Kart World wrote 870 and
+513 MiB in half an hour where it wrote 2.2 to 2.5 GiB with whole slots, at the same frame rate.
 
 ## What was there
 
@@ -79,8 +82,10 @@ woken= evicted= moved= whole=`.
 
 ## Open
 
-- Everything that maps: units into a reservation, a slab seen at two addresses, faults on
-  several units of one slot from several threads, zstd inside the fault handler.
+- Everything that maps (units into a reservation, a slab seen at two addresses, faults on
+  several units of one slot from several threads, zstd inside the fault handler) has run in four
+  sessions, 350,000 units brought back, and no more: an hour of Mario Kart World and base PS5
+  memory are not tried.
 - `pack_released` (what packing is counted to have freed) is approximate for slots in units.
 - Whether Lichii's packing pass (`EDEN_SWAP_PASS=2`), which ended Mario Kart World sessions early
   with 2 MiB slots, does better with units. Not tried.

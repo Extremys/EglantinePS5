@@ -1,20 +1,21 @@
 # More of PS5_Lichii's memory and speed work, on top of the swap store
 
-Status, 2026-11-23: being implemented in this branch, stacked on `feature/safe-swap` (PR #135),
-which brought PS5_Lichii's swap store. **None of it has run on the console yet**: by decision the
-console runs come once, at the end (two of Mario Kart World, one of Donkey Kong Bananza, one of
-Ocarina of Time, against the numbers PR #135 has). Each step has a switch that restores what was
-there before, so that a result can be traced to its step afterwards.
+Status, 2026-11-23: implemented in this branch, stacked on `feature/safe-swap` (PR #135), which
+brought PS5_Lichii's swap store. By decision the console runs came once, at the end, with all of
+it together (two of Mario Kart World, one of Donkey Kong Bananza, one of Ocarina of Time, against
+the numbers PR #135 has): see [The console runs](#the-console-runs). Each step has a switch that
+restores what was there before, so that a result can be traced to its step afterwards; no step
+was measured on its own.
 
 | Step | State | Switch back |
 |---|---|---|
-| 1a. The transcode's decode image, a few layers at a time | written (`TranscodeAstcToBcn`), syntax and arithmetic checked | `EDEN_PS5_TRANSCODE_LAYER_BATCH=0` |
+| 1a. The transcode's decode image, a few layers at a time | written; ran in the console runs (Mario Kart World's arrays decoded 6 and 12 layers at a time) | `EDEN_PS5_TRANSCODE_LAYER_BATCH=0` |
 | 1b. BC7 texture store (emulator side and tool) | written, `docs/TEXTURE-STORE.md`; no store exists for any game yet, so it is idle until the tool has been run over one | `EDEN_NX2_TEXTURE_STORE=0` |
-| 2, 3. Slots nothing touches in 64 KiB units: zstd in memory, the swap store, one unit back at a touch | written, host-checked (`eden_swap_check` steps 64 to 67), compiles for the console | `EDEN_CRAM_UNITS=0` |
-| 4. JIT code caches backed as written | written, host-checked (`CheckCodeRanges`), `docs/JIT-CODE-CACHE-LAZY.md` | `EDEN_JIT_LAZY_CACHE=0` |
-| 5. What the pool has free, counted in 2 MiB pieces for the caches | written | `EDEN_POOL_FREE_PIECES=0` |
+| 2, 3. Slots nothing touches in 64 KiB units: zstd in memory, the swap store, one unit back at a touch | written, host-checked (`eden_swap_check` steps 64 to 67), reviewed; ran in the console runs | `EDEN_CRAM_UNITS=0` |
+| 4. JIT code caches backed as written | written, host-checked (`CheckCodeRanges`), `docs/JIT-CODE-CACHE-LAZY.md`; ran in the console runs | `EDEN_JIT_LAZY_CACHE=0` |
+| 5. What the pool has free, counted in 2 MiB pieces for the caches | written; ran in the console runs | `EDEN_POOL_FREE_PIECES=0` |
 | 6. The fastmem window by default | not done, see below | |
-| 7. Our own memcmp | ported, host-checked (`tools/check-memcmp.py`) | build-time only |
+| 7. Our own memcmp | ported, host-checked (`tools/check-memcmp.py`); in the build the console ran | build-time only |
 
 Source: PS5_Lichii (mihawk, `codeberg.org/mihawk/PS5_Lichii`, commit `5a424f7`), its
 `docs/ps5/levers.md` and the topic files beside it. What Lichii reports there for the PS5 Pro is
@@ -66,6 +67,36 @@ the largest.
 
 Each step is measured on the console before the next, with Mario Kart World (30 minutes and an
 hour) and Ocarina of Time, as PR #135 was. Steps 1 and 3 are the large ones.
+
+## The console runs
+
+PS5 Pro, 2026-11-23, one release build with everything above at its defaults (scripted input, as
+PR #135's runs; no texture store exists for any of the games, so step 1b did nothing). Against
+the swap store alone, from `docs/GUEST-MEMORY-SWAP.md`:
+
+| | The swap store alone (PR #135) | With this branch |
+|---|---|---|
+| Ocarina of Time, 3 minutes | 33.2 to 33.4 FPS (3 runs) | 34.0 FPS |
+| Donkey Kong Bananza, 3 minutes | 30.1 and 30.6 FPS | 30.3 FPS |
+| Mario Kart World, 30 minutes, 1st session | ran, 31.5 FPS, 117 frames over 100 ms, worst 3.8 s, 2,468 MiB written | ran, 31.3 FPS, 94 frames over 100 ms, worst 3.8 s, 870 MiB written |
+| Mario Kart World, 30 minutes, 2nd session | ran, 31.0 and 31.2 FPS, 112 and 121 frames over 100 ms, worst 5.8 and 4.5 s, 2,229 and 2,152 MiB written | ran, 31.5 FPS, 87 frames over 100 ms, worst 3.2 s, 513 MiB written |
+
+- **The frame rate is where it was.** Mario Kart World's two runs are inside the three before,
+  and Donkey Kong Bananza's one between the two before. Ocarina of Time's one run is 0.6 FPS
+  above the store's three and inside the 33.5 to 34.2 of the first swap design's six: one run
+  does not say it gained.
+- **A third to a quarter of the writes** in Mario Kart World: 870 and 513 MiB where it was 2.2 to
+  2.5 GiB, with fewer long frames. The second session found 952 MiB of what it sent in the store
+  already. An hour was not run, so how long a day's 8 GiB lasts now is not known (with whole
+  slots it was little more than an hour, and the rate grew with the session's length).
+- **Units on the console** (the last report of each Mario Kart World session): about 2,000 slots
+  (4 GiB of the guest's address space) in units, 590 to 610 MiB of them in memory in slabs;
+  6,500 slots made into units, 160,000 units packed with zstd, 30,000 that stayed in memory,
+  170,000 to 180,000 units brought back at a touch in 76 to 99 µs each, 4,100 to 4,200 slots
+  made whole again. Ocarina of Time: about 1,030 slots in units, 212 MiB in memory.
+- No session ended early, no crash report, nothing refused for want of memory (24 requests for
+  memory back in each Mario Kart World session, each answered).
+- Not measured: an hour of Mario Kart World, base PS5 memory, and each step on its own.
 
 ## Rules for the console tests
 

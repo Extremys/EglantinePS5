@@ -9,8 +9,9 @@ BC7 and is filled from the file.
 Ported from PS5_Lichii (mihawk, codeberg.org/mihawk/PS5_Lichii, commit 5a424f7, GPL-3.0-or-later). Our core and
 Lichii's share an ancestor but differ, so this is a port by reading, not a copy.
 
-**Nothing in this document has been built or run.** It was written without a build and without the console; the
-changed files only passed a compiler's syntax check. See "Untested" before relying on any of it.
+**The store's path has not run.** It was written without a build; since then the code builds for the console and
+that build ran four sessions (`docs/LICHII-MEMORY-PLAN.md`, "The console runs"), but with no store folder for any
+game, so every lookup returned at its first line. The layer batches of the transcode did run (Mario Kart World). See "Untested" before relying on any of it.
 
 Without a store folder for the running game the emulator does what it did before: the only new work is one
 attempt to open the folder when the game starts.

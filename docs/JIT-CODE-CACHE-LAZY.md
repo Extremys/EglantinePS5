@@ -1,7 +1,9 @@
 # JIT code caches: memory by the 2 MiB piece, 320 MiB a core
 
-Status, 2026-11-23: written and checked on the host (mocked native calls); **not built for the
-console and not run there**. Step 4 of `docs/LICHII-MEMORY-PLAN.md`.
+Status, 2026-11-23: written and checked on the host (mocked native calls); built for the console
+and run there since in four sessions with the rest of the plan (`docs/LICHII-MEMORY-PLAN.md`, "The
+console runs": Mario Kart World's six caches were 320 MiB each with 20 MiB held at the start),
+without the checks listed at the end being made one by one. Step 4 of `docs/LICHII-MEMORY-PLAN.md`.
 
 **On by default.** `EDEN_JIT_LAZY_CACHE=0` (`env.txt`) keeps the caches as they were.
 `EDEN_PS5_CODE_CACHE_MIB=<n>` sets the size of every core's cache.
@@ -121,7 +123,7 @@ core that compiles little would hold 6 to 8 MiB instead of 20.
   steps as the JIT asks, one memory behind both views, a fault past the memory and for a write
   to the view that runs, everything given back. The function was compiled alone against
   `src/memory_pages.cpp` on the host and passed with and without `EDEN_JIT_LAZY_CACHE=0`;
-  `eden-memory-check` itself was not built.
+  `eden-memory-check` was built with it afterwards and passes.
 - A scratch check with native calls mocked to honour `MAP_FIXED` and to refuse memory (not in
   the repository): six caches of 320 MiB side by side, a seventh outside the span, a piece
   that comes after three refusals, a cache leaving the span while the others run and the next
