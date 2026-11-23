@@ -62,13 +62,21 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
 // `writes`: what it writes to guest memory (GpuSplit::Writes).
 template <typename Func>
 void OnBack(const Func& func,
-            VideoCommon::GpuSplit::Writes writes = VideoCommon::GpuSplit::Writes::Anywhere) {
+            VideoCommon::GpuSplit::Writes writes = VideoCommon::GpuSplit::Writes::Anywhere,
+            u64 flags = 0) {
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.Defer(func, 0, writes);
+        split.Defer(func, flags, writes);
     } else {
         VideoCommon::Nx2FastDraw::BreakUnsplit(VideoCommon::Nx2FastDraw::Reason::Call);
         func();
     }
+}
+
+// A semaphore release and a syncpoint increment change nothing a draw resolves to: the
+// rasterizer notes the sync where they reach it (uniform keeps read their buffers again), and
+// the draws around them keep their pipeline, views and bindings (EDEN_NX2_FAST_DRAW_MORE).
+u64 SyncNeutral() {
+    return VideoCommon::Nx2FastDraw::More() ? VideoCommon::GpuSplit::FastDrawNeutral : 0;
 }
 
 // Fence work (ReleaseFences, SignalSyncPoint, SignalReference) writes guest memory through fence
@@ -392,7 +400,7 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
     case Puller::FenceOperation::Increment:
         OnBack([rasterizer = dma_pusher.rasterizer, id = static_cast<u32>(regs.fence_action.syncpoint_id.Value())] {
             rasterizer->SignalSyncPoint(id);
-        }, FenceWrites);
+        }, FenceWrites, SyncNeutral());
         break;
     default:
         UNIMPLEMENTED_MSG("Unimplemented operation {}", regs.fence_action.op.Value());
@@ -434,7 +442,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 rasterizer->Query(mirror, VideoCommon::QueryType::Payload,
                                   properties | VideoCommon::QueryPropertiesFlags::Nx2Mirror, payload, 0);
             }
-        }, VideoCommon::GpuSplit::Writes::Noted);
+        }, VideoCommon::GpuSplit::Writes::Noted, SyncNeutral());
         NoteRelease(dma_pusher, sequence_address, payload,
                     properties == VideoCommon::QueryPropertiesFlags::HasTimeout,
                     VideoCommon::GpuSplit::ReportLanding(

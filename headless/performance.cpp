@@ -687,7 +687,11 @@ void ReportHeap(const char* why) {
 
 std::size_t TrimHeap(const char* why) {
     if (!eden_heap_trim) return 0;
+    const long long start = NowNs();
     const std::size_t returned = eden_heap_trim();
+    // On the thread that asks "is memory short?" (the GPU thread): a slow trim is a frame held.
+    if (const long long ms = (NowNs() - start) / 1'000'000; ms >= 50)
+        std::fprintf(stderr, "EDEN_HEAP_TRIM took %lld ms for %zu MiB (%s)\n", ms, returned >> 20, why);
     if (returned != 0) {
         char text[160];
         std::snprintf(text, sizeof(text), "gave back %zu MiB: %s", returned >> 20, why);
