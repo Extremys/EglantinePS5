@@ -265,6 +265,26 @@ static void UpdateGrips(Core::System& system, Eden::Pad& pad) {
 void EdenRegisterNirBackend(); // nir_backend.cpp
 #endif
 
+#if defined(PS5_NATIVE)
+// Development: /data/eglantineps5/env.txt also applies before the core's static initializers.
+// Several of its diagnostic switches are constants read with getenv at start-up
+// (EDEN_NX2_GUEST_THREAD_STATS, EDEN_NX2_FS_READ_TRACE...), which main's reader came too late for.
+__attribute__((constructor(101))) static void EarlyEnvironment() {
+    std::FILE* const file = std::fopen("/data/eglantineps5/env.txt", "r");
+    if (file == nullptr) return;
+    char line[512];
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        line[std::strcspn(line, "\r\n")] = 0;
+        char* const split = std::strchr(line, '=');
+        if (line[0] == '#' || split == nullptr || split == line) continue;
+        *split = 0;
+        setenv(line, split + 1, 1);
+    }
+    std::fclose(file);
+}
+#endif
+
+
 int main(int argc, char** argv) {
     try {
 #ifdef EDEN_PS5_RADV

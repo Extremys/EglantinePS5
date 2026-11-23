@@ -673,7 +673,16 @@ void ReportHeap(const char* why) {
                      eden_heap_arena_empty, eden_heap_arena_quarter,
                      ((held - large) > arenas ? (held - large) - arenas : 0) >> 20);
     }
-    if (eden_heap_sites_report) eden_heap_sites_report();
+    // The places that hold the heap, a measurement: it walks the table of followed blocks and
+    // writes some thirty lines, 0.8 s on the GPU thread that asks (the texture collector's "is
+    // memory short?"), and it came with every heap trim (each 2 s while the pool is short) and
+    // every 10 s: Ocarina of Time stopped drawing for 0.8 to 1.5 s each time. EDEN_HEAP_SITES=1
+    // has the reports carry it again.
+    static const bool sites = [] {
+        const char* const value = std::getenv("EDEN_HEAP_SITES");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (eden_heap_sites_report && sites) eden_heap_sites_report();
 }
 
 std::size_t TrimHeap(const char* why) {

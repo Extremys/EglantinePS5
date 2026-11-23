@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
 #endif
 #include "video_core/renderer_vulkan/vk_present_manager.h"
+#include "video_core/nx2_back_watch.h"
 #include "gpu_failure.h"
 #include "performance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -215,9 +216,12 @@ void PresentManager::Present(Frame* frame) {
     } else {
         {
             VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PresentWait};
+            VideoCommon::BackWatch::Step("present: wait for the worker");
             scheduler.WaitWorker();
         }
+        VideoCommon::BackWatch::Step("present: copy to swapchain");
         CopyToSwapchain(frame);
+        VideoCommon::BackWatch::Step("present: done");
         free_queue.push_back(frame);
     }
 }
@@ -462,6 +466,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         return;
     }
 
+    VideoCommon::BackWatch::Step("present: acquire image");
     while (swapchain.AcquireNextImage(!use_present_thread)) {
         RecreateSwapchain(frame);
     }
@@ -595,7 +600,9 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
 
     // Submit the image copy/blit to the swapchain
     {
+        VideoCommon::BackWatch::Step("present: submit lock");
         std::scoped_lock submit_lock{scheduler.submit_mutex};
+        VideoCommon::BackWatch::Step("present: submit");
         switch (const VkResult result =
                     device.GetGraphicsQueue().Submit(submit_info, *frame->present_done)) {
         case VK_SUCCESS:
@@ -610,7 +617,9 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
     // Present
+    VideoCommon::BackWatch::Step("present: flip");
     swapchain.Present(render_semaphore);
+    VideoCommon::BackWatch::Step("present: flipped");
 }
 
 } // namespace Vulkan
