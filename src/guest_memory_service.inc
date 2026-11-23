@@ -201,6 +201,17 @@ bool GpuCachedSlot(std::size_t slot) noexcept {
     auto* table = gpu_cached_table.load(std::memory_order_acquire);
     return table != nullptr && slot < gpu_cached_slots && table[slot].load(std::memory_order_acquire) > 0;
 }
+// Whether such a slot stays whole. EDEN_CRAM_SPLIT_GPU=1 (an experiment) lets it be split into
+// 64 KiB units like any other: the rule dates from Ocarina of Time's silent exits, later traced to
+// the driver's trim hooks applied twice, and it keeps 2.5 GB of that game's memory (1,278 slots
+// after 16 minutes in Kokiri Forest) from the unit packer, which halves what it packs elsewhere.
+bool SplitKeepsGpu(std::size_t slot) noexcept {
+    static const bool split = [] {
+        const char* value = std::getenv("EDEN_CRAM_SPLIT_GPU");
+        return value != nullptr && value[0] == '1';
+    }();
+    return !split && GpuCachedSlot(slot);
+}
 // Slots a GPU thread (the command reader "GPU", or "GPUBack") ever had to unpack: never packed again.
 // The caches' count misses what the command reader reads (command lists, draw arguments), and one
 // such unpack was enough for impossible draws.
@@ -1386,7 +1397,7 @@ bool HandleGuestWriteFault(void* fault) noexcept {
     // Zero and Sub slots back the written 64 KiB unit only (SubEnabled); they stay (become) Sub.
     const std::size_t unit = (address - SlotAddress(*range, slot)) % SparseSlot / SubUnit;
     // (a Zero slot the GPU's mappings hold is promoted whole: MapSub would unmap it for a moment)
-    const bool sub = range->sub != nullptr && (state == SlotSub || (state == SlotZero && SubEnabled() && !GpuCachedSlot(slot)));
+    const bool sub = range->sub != nullptr && (state == SlotSub || (state == SlotZero && SubEnabled() && !SplitKeepsGpu(slot)));
     // A write fault on a unit that is backed and writable has nothing to change (counted as a repeat).
     const bool unchanged = state == SlotSub && (range->sub[slot] & ~range->sub_probe[slot] & (1u << unit));
     const auto promote = [&]() noexcept {
@@ -1626,14 +1637,14 @@ bool ScanFine(SparseRange& range, std::size_t slot) noexcept {
 bool ScanSub(SparseRange& range, std::size_t slot, std::size_t min_zero = SubMinZeroUnits()) noexcept {
 #ifdef PS5_NATIVE
     const std::uintptr_t at = SlotAddress(range, slot);
-    if (range.sub == nullptr || GpuCachedSlot(slot) ||
+    if (range.sub == nullptr || SplitKeepsGpu(slot) ||
         (min_zero != 0 && counters.passes.load(std::memory_order_relaxed) < range.fine_after[slot]))
         return false;
     std::size_t zeros = 0;
     for (std::size_t unit = 0; unit < SubUnits; ++unit) zeros += UnitZero(at + unit * SubUnit);
     if (zeros < min_zero) return false;
     LockSlot(range, slot);
-    if (SlotState(range, slot) != SlotOwn || GpuCachedSlot(slot)) {
+    if (SlotState(range, slot) != SlotOwn || SplitKeepsGpu(slot)) {
         UnlockSlot(range, slot, SlotState(range, slot));
         return false;
     }
@@ -1859,7 +1870,7 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
         return false;
     }
     LockSlot(range, slot);
-    if (SlotState(range, slot) != SlotOwn || GpuCachedSlot(slot)) {
+    if (SlotState(range, slot) != SlotOwn || SplitKeepsGpu(slot)) {
         UnlockSlot(range, slot, SlotState(range, slot));
         return false;
     }
