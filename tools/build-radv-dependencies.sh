@@ -40,6 +40,12 @@ for lang, compiler in [('c', 'prospero-clang'), ('cpp', 'prospero-clang++')]:
 p.write_text(s)
 PY
 bash "$vulkan/tools/setup-native-dependencies.sh"
+# Always patch a clean export. build-radv.sh re-exports the pinned Mesa only when the tree's
+# .revision differs, and the patch scripts below are not all idempotent: run over an already
+# patched tree, patch-radv-trim.py's destroy hooks went in twice, every destroyed image was
+# counted out twice, and the trim gave back memory live textures were on (white scenes, GPU
+# page faults in the device-memory region, the process ended).
+rm -f "$vulkan/.deps/work/radv-src/.revision" "$vulkan/.deps/native/radv-release/PROVENANCE.txt"
 bash "$vulkan/tools/build-radv.sh" release
 python3 "$root/tools/patch-radv-wsi.py"
 python3 "$root/tools/patch-radv-disk-cache.py"
