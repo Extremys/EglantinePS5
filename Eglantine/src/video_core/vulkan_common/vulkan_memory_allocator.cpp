@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <thread>
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -67,6 +69,21 @@ VkResult RecoverDeviceMemory(VkResult result, VkDeviceSize bytes, Create&& creat
             break;
         }
         result = create();
+    }
+    // Still refused. The driver keeps memory nothing is bound to for two seconds before it gives
+    // it back (commands recorded earlier may still use it), and the caches answer the pressure
+    // over the next frames: wait for both in short steps rather than end the session. Ocarina of
+    // Time ended with VK_ERROR_OUT_OF_DEVICE_MEMORY at an area change after 12 minutes in Kokiri
+    // Forest with 252 MiB in that quarantine.
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && &eden_memory_recover != nullptr) {
+        int waits = 0;
+        for (; result == VK_ERROR_OUT_OF_DEVICE_MEMORY && waits < 12; ++waits) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{250});
+            (void)eden_memory_recover(static_cast<std::size_t>(bytes) + (std::size_t{64} << 20));
+            result = create();
+        }
+        LOG_WARNING(Render_Vulkan, "Device memory for {} MiB {} after waiting {} ms for memory back",
+                    bytes >> 20, result == VK_SUCCESS ? "found" : "still refused", waits * 250);
     }
     return result;
 }

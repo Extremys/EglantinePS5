@@ -3132,8 +3132,15 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait) noexcept {
 }
 } // namespace
 
-// Waits for the scanner if it is packing (the driver's allocations).
-extern "C" std::size_t eden_memory_recover(std::size_t bytes) noexcept { return RecoverMemory(bytes, true); }
+// Waits for the scanner if it is packing (the driver's allocations). The heap's empty pieces go
+// back too when that was not enough (headless/heap_arenas.inc; not for the heap's own requests,
+// which hold its growth lock).
+extern "C" [[gnu::weak]] std::size_t eden_heap_trim(void);
+extern "C" std::size_t eden_memory_recover(std::size_t bytes) noexcept {
+    std::size_t freed = RecoverMemory(bytes, true);
+    if (freed < bytes && &eden_heap_trim != nullptr) freed += eden_heap_trim();
+    return freed;
+}
 // Never waits: for the heap, which may hold its growth lock while the scanner allocates.
 extern "C" std::size_t eden_memory_recover_try(std::size_t bytes) noexcept { return RecoverMemory(bytes, false); }
 
