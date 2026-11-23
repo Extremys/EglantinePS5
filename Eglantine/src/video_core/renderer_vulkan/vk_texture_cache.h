@@ -301,7 +301,8 @@ public:
     void TranscodeAstcToBcn(Image& image, const StagingBufferRef& map,
                             std::span<const VideoCommon::SwizzleParameters> swizzles);
 
-    /// Temporary decode images, reusable once the GPU is past `tick`.
+    /// Temporary decode images, reusable once the GPU is past `tick`. `layers` is the decode
+    /// image's own count: fewer than the texture's when it is decoded in batches of layers.
     struct PendingTranscode {
         u64 tick;
         vk::Image image;
