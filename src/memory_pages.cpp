@@ -18,6 +18,7 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <thread>
 #include <unistd.h>

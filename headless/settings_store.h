@@ -727,9 +727,9 @@ inline bool SavePerformance(uint64_t title_id, const PerformanceSettings& value,
     return Settings::Write(document, file);
 }
 
-// The swap file for a game's memory (src/guest_memory_service.inc, docs/GUEST-MEMORY-SWAP.md):
-// "performance/swap_file", on unless the file says false. For every game: it is the console's
-// storage that it writes to.
+// The swap store for a game's memory (src/guest_memory_service.inc, docs/GUEST-MEMORY-SWAP.md):
+// "performance/swap_file", on unless the settings file says false. For every game: it is the
+// console's storage that it writes to.
 inline bool LoadSwapFile(const std::string& file = SettingsFile()) {
     return Settings::Bool(Settings::Load(file), Settings::Json::json_pointer("/performance/swap_file"), true);
 }

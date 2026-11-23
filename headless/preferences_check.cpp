@@ -424,7 +424,7 @@ int main() {
     assert(Eden::SavePerformance(racer, speed, by_hand) && Eden::SavePerformance(0, Eden::LoadPerformance(0, by_hand), by_hand));
     assert(Eden::LoadGpuClock(racer, by_hand) == "overclock" && Eden::LoadGpuClock(quest, by_hand) == "normal");
     assert(Eden::LoadPerformance(racer, by_hand).block_list);
-    // The swap file ("swap_file", settings file only, for every game): on unless the file says
+    // The swap store ("swap_file", settings file only, for every game): on unless the file says
     // false, and saving the performance switches keeps what it says.
     assert(Eden::LoadSwapFile(by_hand));
     std::ofstream(by_hand) << R"({"performance": {"swap_file": false, "fast_gpu": true}})";

@@ -13,11 +13,11 @@
 //           others a compact block that holds only them (a written slot with many pages of zeroes);
 //           a write makes it whole again, and it waits longer each time before it may be Fine again
 //
-//   Packed  the slot has no block: its data is LZ4-compressed in the packed store, or in the swap file
+//   Packed  the slot has no block: its data is LZ4-compressed in the packed store, or in the swap store
 //           on the console's storage ("Swap" below); any access unpacks it
 //   Idle    the slot keeps its block but allows no access: the first access of any kind wakes it. How
 //           the scanner learns which slots nothing reads or writes; only those are packed or swapped
-//   Clean   the slot has its block back from the swap file, read-only, and the file still holds the
+//   Clean   the slot has its block back from the swap store, read-only, and the store still holds the
 //           same bytes: giving the block up again costs no write to the storage. A write makes it Own
 //
 // A write to a Zero or Shared slot faults; HandleGuestWriteFault gives the slot a block of its
@@ -187,10 +187,10 @@ void Spin(std::atomic_flag& flag) noexcept {
 // data lives in the heap. A buffer the fault handler is done with is freed by the scanner (no
 // free in a signal handler): it goes on a list through its first word.
 struct PackedSlot {
-    void* data = nullptr;       // in the packed store (memory); null when the data is in the swap file
-    std::uint32_t size = 0;     // bytes stored (in the swap file, SparseSlot: stored as it was)
-    std::uint32_t swap = 0;     // the swap file unit it starts at, + 1; 0: not in the file
-    std::uint64_t hash = 0;     // swap file only: FullHash of the slot's 2 MiB, checked when read back
+    void* data = nullptr;       // in the packed store (memory); null when the data is in the swap store
+    std::uint32_t size = 0;     // bytes in the packed store
+    std::uint32_t swap = 0;     // not 0: the swap store has the slot's bytes (its units' slots are in swap_units)
+    std::uint64_t hash = 0;     // swap store only: FullHash of the slot's 2 MiB, checked when read back
 };
 std::atomic<PackedSlot*> packed_slots{nullptr}; // per slot of the guest's range, made by the scanner
 // Diagnostic (EDEN_CRAM_PACK_KEEP=1): a packed slot keeps its block, and the unpack compares what it
@@ -301,69 +301,70 @@ void StoreRelease(void* data, std::uint32_t size) noexcept {
     const std::size_t index = (reinterpret_cast<std::uintptr_t>(data) - store_base) / StoreBlock;
     store_live[index].fetch_sub(size, std::memory_order_release);
 }
-// ---- Swap: packed slots on the console's storage ----
+// ---- Swap: slots that do not pack, in a store on the console's storage ----
 // The packed store gives back what LZ4 saves, and nothing for a slot that does not compress: the
 // textures, models and sound a game keeps in its own memory once the GPU has its copy. At a Mario
 // Kart World race load thousands of such slots were looked at and left (skips=3456) while the pool
-// ran out. With a file behind the store such a slot's block goes back too.
+// ran out. With a store on the console's storage behind the packed store such a slot's block goes
+// back too.
 //
-// The file is on the console's internal storage, whose flash wears with every byte written, so
-// writes are what this part is built around:
-//   - Nothing is written unless an allocation has failed and asked for memory back: a game that
-//     fits writes the file's test page (16 KiB) at most. And then only what the pool lacks.
-//   - Memory first: a slot that compresses well goes to the packed store, as before. Only the others
-//     go to the file, LZ4-compressed when that saves a tenth or more.
-//   - Only slots nothing touched for a while go (Idle slots, below): a slot read back comes back as
-//     Clean, and the file keeps its bytes. Giving a Clean slot's block up again writes nothing, so
-//     data the game only reads is written once a session however often it comes and goes.
-//   - Memory the game reuses (written again after a while unwritten: swap_rewritten) goes last, and
-//     only when a request for memory would otherwise get nothing.
-//   - A budget: at most EDEN_SWAP_BURST_MIB at once, refilled at EDEN_SWAP_RATE_MIB_MIN a minute, at
-//     most EDEN_SWAP_SESSION_MIB a session and EDEN_SWAP_DAY_MIB a day. A small ledger beside the
-//     file carries the day's and the lifetime's count over sessions; it is charged before the writes
-//     it counts, so a session that ends without warning is counted in full. With the budget used
-//     up nothing more is written; what the file holds stays readable.
-//   - The file is at most EDEN_SWAP_MIB, never synced, gone when the session ends (it is unlinked
-//     as soon as it is open, so a crash leaves nothing), and not made at all when the storage has
-//     less than EDEN_SWAP_KEEP_FREE_MIB free.
-// Safe: a slot's bytes are hashed when written and checked when read back, the file is tested once
-// before it is trusted, a failed or refused write leaves the slot as it was (and ends swapping), and
-// data that does not come back as it was ends the session rather than reaching the game.
-// EDEN_SWAP=0 turns it off; it is off without storage access (no EDEN_SWAP_PATH).
-constexpr std::size_t SwapUnit = 64 * 1024;
-constexpr std::size_t SwapMaxUnits = (std::size_t{8} << 30) / SwapUnit; // the file: 8 GiB at most
-constexpr std::size_t SwapPackMax = SparseSlot / 10 * 9;                // above this it is stored as it is
-std::atomic<std::uint64_t> swap_map[SwapMaxUnits / 64];                 // a bit per unit in use
-std::size_t swap_units = 0, swap_hint = 0;                              // the file's limit; where to look next
-int swap_fd = -1;
-std::atomic<int> swap_state{0};                                         // 0 not started, 1 on, 2 off
-char swap_ledger_path[512];
-// The budget and the ledger (pack_mutex held).
-std::uint64_t swap_tokens = 0, swap_burst = 0, swap_rate = 0 /* bytes a second */, swap_token_ns = 0;
-std::uint64_t swap_session_limit = 0, swap_day_limit = 0;
-std::uint64_t swap_day = 0, swap_day_before = 0, swap_total_before = 0, swap_ledger_done = 0;
-std::uint64_t swap_day_start = 0; // what the session had written when its day began (SwapDayRoll)
-// What counts against the day's limit, of `written` in this session.
-std::uint64_t SwapDayBytes(std::uint64_t written) noexcept {
-    return swap_day_before + (written - std::min(written, swap_day_start));
-}
-// A session that runs past midnight (UTC) starts a new day there: what it wrote before stays with
-// the old one (pack_mutex held).
-void SwapDayRoll(std::uint64_t written) noexcept {
-    if (const std::uint64_t today = static_cast<std::uint64_t>(time(nullptr)) / 86400; today > swap_day) {
-        swap_day = today;
-        swap_day_before = 0;
-        swap_day_start = written;
-    }
-}
-std::atomic<std::uint64_t> swap_written{0}, swap_writes{0}, swap_write_ns{0}, swap_raw{0};
+// The store is PS5_Lichii's (mihawk, codeberg.org/mihawk/PS5_Lichii: Ps5SwapOpen and Ps5SwapOut in
+// src/common/host_memory.cpp there), and it is used as it is there, because the storage's flash
+// wears with every byte written and this store writes few:
+//   - <cache>/swap/store.bin is slots of 64 KiB, index.bin the hashes of their contents in slot
+//     order. A slot is found by its contents: 64 KiB that are to go are hashed, looked up, and
+//     compared byte for byte with the slot the hash names. What the store holds already costs no
+//     write.
+//   - Both files stay between sessions. A game's own data, loaded as it was the last time, is found
+//     there again in every later session.
+//   - A slot is never written twice, and the store only grows, up to EDEN_SWAP_MIB (8 GiB). What a
+//     session writes is what the store grew by.
+//   - Writes are kept under 8 GiB an hour, with 1 GiB to start (EDEN_SWAP_RATE_MIB_HOUR,
+//     EDEN_SWAP_BURST_MIB), and the store leaves EDEN_SWAP_KEEP_FREE_MIB of the storage free.
+// Three things are not as there. A store with less than a quarter of its size left starts over at
+// the next launch, once a day at most (SwapStart), where Lichii's takes nothing new once it is
+// full. Slots go to it when an allocation has failed, not before (PackPass has why). And the budget
+// is twice Lichii's (SwapStart has why).
+// A slot of the guest's memory is 2 MiB here, where a unit is 64 KiB there. It goes as 32 units,
+// each found or appended on its own, and a unit of zeroes takes no slot of the store.
+// A request for memory after a failed allocation sends the slots nothing touches and that will not
+// pack there (RecoverMemory); the scanner's pass can do so ahead of any, as Lichii's does (PackPass,
+// EDEN_SWAP_PASS).
+// Safe: a lookup compares bytes, so neither two contents with one hash nor an index that a power
+// cut left ahead of its store can pass for a slot's data. A slot of the guest's memory is hashed
+// whole when it goes and checked when it comes back (Lichii trusts the store there); data that does
+// not come back as it was ends the session rather than reaching the game. A failed write leaves
+// the slot as it was and ends swapping. Since no slot of the store is ever rewritten, a fault
+// handler reads it without any lock against the one writer (the holder of pack_mutex).
+// EDEN_SWAP=0 turns it off; it is off without storage access (no EDEN_SWAP_DIR).
+constexpr std::size_t SwapUnit = 64 * 1024;                              // a slot of the store
+constexpr std::size_t SwapUnits = SparseSlot / SwapUnit;                 // of them in a slot of the guest's memory
+constexpr std::size_t SwapMaxSlots = (std::size_t{8} << 30) / SwapUnit;  // the store: 8 GiB at most
+constexpr std::size_t SwapTableSize = SwapMaxSlots * 2;                  // (a power of two)
+constexpr std::uint32_t SwapZeroUnit = 0xFFFFFFFFu;                      // a unit of zeroes: no slot of the store
+int swap_store_fd = -1, swap_index_fd = -1;
+std::atomic<int> swap_state{0}; // 0 not started, 1 on, 2 off
+// The store's slots (pack_mutex held: one writer).
+std::uint32_t swap_count = 0, swap_carried = 0; // held now; left by earlier sessions
+std::uint32_t swap_cap = 0, swap_limit = 0;     // most it may hold (EDEN_SWAP_MIB); and with the storage's free space as it is
+std::uint32_t* swap_table = nullptr;                            // slot + 1 by content hash, open addressing
+std::uint64_t* swap_hashes = nullptr;                           // each slot's content hash
+// Slots read back to be compared (SwapHeld): one, or the run after it once a second in a row is asked for.
+std::uint8_t* swap_check = nullptr;
+// A slot's new units, side by side for their one write (SwapOutSlot).
+std::uint8_t* swap_gather = nullptr;
+std::uint32_t swap_check_first = 0, swap_check_slots = 0, swap_check_last = 0xFFFFFFFFu;
+// The budget (pack_mutex held).
+std::int64_t swap_tokens = 0, swap_burst = 0, swap_rate = 0; // bytes; bytes a second
+std::uint64_t swap_token_ns = 0, swap_keep_free = 0;
+char swap_folder[448];
+// (bytes appended this session; units appended, found in the store and of zeroes; 2 MiB slots read back)
+std::atomic<std::uint64_t> swap_written{0}, swap_appended{0}, swap_found{0}, swap_zero_units{0}, swap_write_ns{0};
+std::atomic<std::uint64_t> swap_appends{0}; // the writes those bytes went in (one for a slot's new units)
 std::atomic<std::uint64_t> swap_reads{0}, swap_read_ns{0}, swap_read_max_ns{0};
-std::atomic<std::uint64_t> swap_used_units{0}, swap_slots{0}, swap_reused{0}, swap_dirtied{0};
-std::atomic<std::uint64_t> swap_denied_rate{0}, swap_denied_cap{0}, swap_full{0};
-// Buffers for compressed data read back in a fault handler (no allocation there): taken by a flag each.
-constexpr std::size_t SwapScratches = 2;
-char* swap_scratch[SwapScratches];
-std::atomic_flag swap_scratch_taken[SwapScratches];
+// (slots of the guest's memory whose bytes the store has now, given up again without a write, dropped by a write)
+std::atomic<std::uint64_t> swap_slots{0}, swap_reused{0}, swap_dirtied{0};
+std::atomic<std::uint64_t> swap_denied_rate{0}, swap_full{0}, swap_missed{0};
 
 std::uint64_t FullHash(std::uintptr_t at, std::size_t bytes) noexcept;
 std::size_t EnvOr(const char* name, std::size_t fallback) noexcept;
@@ -385,250 +386,363 @@ void SwapOff(const char* why) noexcept {
     swap_off_why.store(why, std::memory_order_release);
     Note("EDEN_SWAP off\n");
 }
-bool SwapLedgerCharge(std::size_t bytes) noexcept;
-// pack_mutex held. False: nothing more may be written (the caller ends swapping).
-bool SwapWrite(const void* from, std::size_t size, std::uint64_t offset) noexcept {
-    if (!SwapLedgerCharge(size)) return false;
-    const std::uint64_t start = SwapNow();
+// Whole, or not at all.
+bool SwapWriteAt(int fd, const void* from, std::size_t size, std::uint64_t offset) noexcept {
     const auto* bytes = static_cast<const char*>(from);
     std::size_t done = 0;
     while (done < size) {
-        const ssize_t wrote = pwrite(swap_fd, bytes + done, size - done, static_cast<off_t>(offset + done));
+        const ssize_t wrote = pwrite(fd, bytes + done, size - done, static_cast<off_t>(offset + done));
         if (wrote < 0 && errno == EINTR) continue;
         if (wrote <= 0) break;
         done += static_cast<std::size_t>(wrote);
     }
-    swap_writes.fetch_add(1, std::memory_order_relaxed);
-    swap_write_ns.fetch_add(SwapNow() - start, std::memory_order_relaxed);
-    // What reached the file counts against the budget even when the write then failed.
-    swap_written.fetch_add(done, std::memory_order_relaxed);
-    swap_tokens -= std::min<std::uint64_t>(swap_tokens, done);
     return done == size;
 }
-// In a fault handler too: read whole, or not at all.
-bool SwapReadAt(void* to, std::size_t size, std::uint64_t offset) noexcept {
+// In a fault handler too.
+bool SwapReadAt(int fd, void* to, std::size_t size, std::uint64_t offset) noexcept {
     auto* bytes = static_cast<char*>(to);
     std::size_t done = 0;
     while (done < size) {
-        const ssize_t got = pread(swap_fd, bytes + done, size - done, static_cast<off_t>(offset + done));
+        const ssize_t got = pread(fd, bytes + done, size - done, static_cast<off_t>(offset + done));
         if (got < 0 && errno == EINTR) continue;
         if (got <= 0) break;
         done += static_cast<std::size_t>(got);
     }
     return done == size;
 }
-// The ledger: the day (days since 1970), what was written that day, and ever. Written to a second
-// file that then takes the ledger's name: the ledger is whole or as it was, whatever happens meanwhile.
-// `session`: what this session is to be counted with. No stdio: a fault handler's request for memory
-// may write to the file, and so charge the ledger.
-char* SwapLedgerText(char* at, const char* text) noexcept {
-    while (*text != 0) *at++ = *text++;
-    return at;
-}
-char* SwapLedgerNumber(char* at, std::uint64_t value) noexcept {
-    char digits[20];
-    int count = 0;
-    do digits[count++] = static_cast<char>('0' + value % 10); while ((value /= 10) != 0);
-    while (count > 0) *at++ = digits[--count];
-    return at;
-}
-bool SwapLedgerWrite(std::uint64_t session) noexcept {
-    if (swap_ledger_path[0] == 0) return false;
-    char record[96];
-    char* end = SwapLedgerText(record, "EGSWAP1 day=");
-    end = SwapLedgerNumber(end, swap_day);
-    end = SwapLedgerText(end, " day_bytes=");
-    end = SwapLedgerNumber(end, SwapDayBytes(session));
-    end = SwapLedgerText(end, " total_bytes=");
-    end = SwapLedgerNumber(end, swap_total_before + session);
-    *end++ = '\n';
-    const auto length = static_cast<std::size_t>(end - record);
-    char fresh[sizeof(swap_ledger_path) + 8];
-    *SwapLedgerText(SwapLedgerText(fresh, swap_ledger_path), ".new") = 0;
-    const int fd = open(fresh, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) return false;
-    // Synced before it takes the ledger's name: after a power cut the ledger is then the old one
-    // or the new one, never an empty file that would forget the day. (As far as the storage
-    // goes along: a sync that is refused does not end swapping.)
-    const bool whole = write(fd, record, length) == static_cast<ssize_t>(length);
-    if (whole) (void)fsync(fd);
-    close(fd);
-    if (!whole || rename(fresh, swap_ledger_path) != 0) return false;
-    swap_ledger_done = session;
-    return true;
-}
-// Before `bytes` more go to the swap file (pack_mutex held): the ledger is charged first, and ahead,
-// SwapLedgerStep at a time. A session that ends without warning (out of memory, the power button)
-// has then never written more than its ledger says, and the next session's limit for the day
-// starts from no less than what the storage took. False: the ledger could not be written, and
-// then nothing else is.
-constexpr std::uint64_t SwapLedgerStep = std::uint64_t{32} << 20;
-bool SwapLedgerCharge(std::size_t bytes) noexcept {
-    const std::uint64_t after = swap_written.load(std::memory_order_relaxed) + bytes;
-    if (after <= swap_ledger_done || SwapLedgerWrite((after / SwapLedgerStep + 1) * SwapLedgerStep)) return true;
-    SwapOff("the ledger could not be written");
-    return false;
-}
-// The exact count instead of the charge, when a session ends in order.
-void SwapLedgerFlush() noexcept {
-    const std::uint64_t written = swap_written.load(std::memory_order_relaxed);
-    if (written != swap_ledger_done) (void)SwapLedgerWrite(written);
-}
-void SwapLedgerRead() noexcept {
-    swap_day = static_cast<std::uint64_t>(time(nullptr)) / 86400;
-    swap_day_before = swap_total_before = swap_day_start = 0;
-    const int fd = open(swap_ledger_path, O_RDONLY);
-    if (fd < 0) return;
-    char record[96] = {};
-    const ssize_t got = read(fd, record, sizeof(record) - 1);
-    close(fd);
-    unsigned long long day = 0, day_bytes = 0, total = 0;
-    if (got <= 0 || std::sscanf(record, "EGSWAP1 day=%llu day_bytes=%llu total_bytes=%llu", &day, &day_bytes, &total) != 3)
-        return;
-    swap_total_before = total;
-    // A clock that went back keeps the day's count (it never forgives what was written).
-    if (day >= swap_day) swap_day_before = day_bytes, swap_day = day;
-}
-// May `bytes` more be written now (pack_mutex held)? `urgent`: memory was refused, not just short.
-bool SwapBudget(std::size_t bytes, bool urgent) noexcept {
-    const std::uint64_t elapsed_ms = (SwapNow() - swap_token_ns) / 1000000ull;
-    swap_tokens = std::min<std::uint64_t>(swap_burst, swap_tokens + elapsed_ms * swap_rate / 1000ull);
-    swap_token_ns += elapsed_ms * 1000000ull;
-    // (A limit is reached when less than a whole slot is left of it, whatever is asked for: a slot is
-    // asked for twice, before it is compressed and with its size after, and the two must agree, or
-    // every slot is compressed for nothing from then on.)
-    const std::uint64_t written = swap_written.load(std::memory_order_relaxed);
-    const std::uint64_t most = std::max<std::uint64_t>(bytes, SparseSlot);
-    SwapDayRoll(written);
-    if (written + most > swap_session_limit || SwapDayBytes(written) + most > swap_day_limit) {
-        swap_denied_cap.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-    // A quarter of the burst is kept for when memory is refused.
-    if (swap_tokens < bytes + (urgent ? 0 : swap_burst / 4)) {
-        swap_denied_rate.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-    return true;
-}
-// A run of `units` free units (pack_mutex held): its first unit, or SwapMaxUnits. Frees come from
-// fault handlers at any time and only clear bits.
-std::size_t SwapAlloc(std::size_t units) noexcept {
-    for (int pass = 0; pass < 2; ++pass) {
-        const std::size_t begin = pass == 0 ? swap_hint : 0;
-        const std::size_t end = pass == 0 ? swap_units : std::min(swap_units, swap_hint + units);
-        std::size_t run = 0;
-        for (std::size_t unit = begin; unit < end; ++unit) {
-            const std::uint64_t word = swap_map[unit / 64].load(std::memory_order_acquire);
-            if (run == 0 && unit % 64 == 0 && word == ~std::uint64_t{0}) {
-                unit += 63;
-                continue;
-            }
-            run = (word >> (unit % 64)) & 1 ? 0 : run + 1;
-            if (run < units) continue;
-            const std::size_t first = unit + 1 - units;
-            for (std::size_t i = first; i <= unit; ++i) swap_map[i / 64].fetch_or(std::uint64_t{1} << (i % 64), std::memory_order_acq_rel);
-            swap_hint = unit + 1 < swap_units ? unit + 1 : 0;
-            swap_used_units.fetch_add(units, std::memory_order_relaxed);
-            return first;
-        }
-    }
-    return SwapMaxUnits;
-}
-void SwapFree(std::size_t first, std::size_t units) noexcept {
-    for (std::size_t i = first; i < first + units; ++i) swap_map[i / 64].fetch_and(~(std::uint64_t{1} << (i % 64)), std::memory_order_acq_rel);
-    swap_used_units.fetch_sub(units, std::memory_order_relaxed);
-}
-std::size_t SwapUnitsOf(std::size_t bytes) noexcept { return (bytes + SwapUnit - 1) / SwapUnit; }
 
-// The file, made when the pool is first short (the scanner), or when memory is first asked back by
-// the driver (pack_mutex held; never in a fault handler or under the heap's lock: it allocates).
+// A unit's content hash: Lichii's Ps5Hash, so that a store reads the same there and here.
+std::uint64_t SwapUnitHash(const std::uint8_t* bytes) noexcept {
+    std::uint64_t hash = 0x9E3779B97F4A7C15ull;
+    for (std::size_t at = 0; at < SwapUnit; at += 8) {
+        std::uint64_t word;
+        std::memcpy(&word, bytes + at, 8);
+        hash = (hash ^ word) * 0xFF51AFD7ED558CCDull;
+        hash ^= hash >> 29;
+    }
+    return hash;
+}
+bool SwapUnitZero(const std::uint8_t* bytes) noexcept {
+    for (std::size_t at = 0; at < SwapUnit; at += 64) {
+        std::uint64_t words[8];
+        std::memcpy(words, bytes + at, 64);
+        if (words[0] | words[1] | words[2] | words[3] | words[4] | words[5] | words[6] | words[7]) return false;
+    }
+    return true;
+}
+// (The table is half empty at most, so a place is a few steps away. An index gone wrong, with one
+// hash thousands of times over, would make it thousands for each: such a slot is left out, and is
+// then one the store holds and no longer finds.)
+void SwapTableInsert(std::uint64_t hash, std::uint32_t slot) noexcept {
+    std::size_t at = hash & (SwapTableSize - 1);
+    for (unsigned steps = 0; swap_table[at] != 0; at = (at + 1) & (SwapTableSize - 1))
+        if (++steps == 4096) return;
+    swap_table[at] = slot + 1;
+}
+
+// How many slots the store may hold now: its limit, and what the storage has free beyond
+// EDEN_SWAP_KEEP_FREE_MIB (looked at when it opens and once a pass).
+void SwapRoom() noexcept {
+    swap_cap = static_cast<std::uint32_t>(
+        std::min<std::size_t>(EnvOr("EDEN_SWAP_MIB", 8192), SwapMaxSlots * SwapUnit >> 20) * ((std::size_t{1} << 20) / SwapUnit));
+    // What the storage has free: not known (the folder is gone, say) is none, and the store does
+    // not grow. (A file system inside its reserve has less than none, which FreeBSD hands through
+    // as a huge count.)
+    struct statvfs space {};
+    std::uint64_t room = 0;
+    if (statvfs(swap_folder, &space) == 0 && space.f_frsize != 0 && space.f_bavail <= space.f_bfree) {
+        const std::uint64_t free_bytes = static_cast<std::uint64_t>(space.f_bavail) * static_cast<std::uint64_t>(space.f_frsize);
+        room = free_bytes > swap_keep_free ? (free_bytes - swap_keep_free) / SwapUnit : 0;
+    }
+    swap_limit = static_cast<std::uint32_t>(std::min<std::uint64_t>(swap_cap, swap_count + std::min<std::uint64_t>(room, swap_cap)));
+}
+
+// The store's files, and the slots earlier sessions left in them: opened when the pool is first
+// short (the scanner), or when memory is first asked back by the driver (pack_mutex held; never in
+// a fault handler or under the heap's lock: it allocates).
 bool SwapStart() noexcept {
     if (const int state = swap_state.load(std::memory_order_acquire); state != 0) return state == 1;
     errno = 0;
     const char* const off = std::getenv("EDEN_SWAP");
-    const char* const path = std::getenv("EDEN_SWAP_PATH");
+    const char* const folder = std::getenv("EDEN_SWAP_DIR");
     if (off != nullptr && off[0] == '0') return SwapOff("switched off"), false;
-    if (path == nullptr || path[0] == 0 || std::strlen(path) + 8 > sizeof(swap_ledger_path)) return SwapOff("no path (no storage access)"), false;
+    if (folder == nullptr || folder[0] == 0 || std::strlen(folder) >= sizeof(swap_folder)) return SwapOff("no folder (no storage access)"), false;
     if (PackKeep()) return SwapOff("EDEN_CRAM_PACK_KEEP"), false;
-    std::size_t limit = std::min<std::size_t>(EnvOr("EDEN_SWAP_MIB", 2048), SwapMaxUnits * SwapUnit >> 20) << 20;
-    const std::size_t keep_free = EnvOr("EDEN_SWAP_KEEP_FREE_MIB", 8192) << 20;
-    // The storage's free space, from the file's folder.
-    char folder[sizeof(swap_ledger_path)];
-    std::snprintf(folder, sizeof(folder), "%s", path);
-    if (char* const slash = std::strrchr(folder, '/'); slash != nullptr && slash != folder) *slash = 0;
-    struct statvfs space {};
-    std::uint64_t free_bytes = ~std::uint64_t{0};
-    if (statvfs(folder, &space) == 0 && space.f_frsize != 0)
-        free_bytes = static_cast<std::uint64_t>(space.f_bavail) * static_cast<std::uint64_t>(space.f_frsize);
-    if (free_bytes < keep_free + (std::uint64_t{256} << 20)) return SwapOff("the storage is nearly full"), false;
-    limit = static_cast<std::size_t>(std::min<std::uint64_t>(limit, free_bytes - keep_free));
-    if (limit < (std::size_t{64} << 20)) return SwapOff("EDEN_SWAP_MIB under 64"), false;
-    for (std::size_t i = 0; i < SwapScratches; ++i)
-        if (swap_scratch[i] == nullptr && (swap_scratch[i] = new (std::nothrow) char[SwapPackMax]) == nullptr)
-            return SwapOff("no memory for its buffers"), false;
-    const int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) return SwapOff("the file could not be made"), false;
-    swap_fd = fd;
-    // Trusted only after a page written to it came back as written (16 KiB: all a session that
-    // never runs out of memory writes).
-    bool tested = false;
+    // (6 MiB of the heap. A request for memory may be the first to come here, with the pool empty
+    // and the heap unable to grow: not for good then, the next pass or request tries again.)
+    if (swap_table == nullptr) swap_table = new (std::nothrow) std::uint32_t[SwapTableSize];
+    if (swap_hashes == nullptr) swap_hashes = new (std::nothrow) std::uint64_t[SwapMaxSlots];
+    if (swap_check == nullptr) swap_check = new (std::nothrow) std::uint8_t[SparseSlot];
+    if (swap_gather == nullptr) swap_gather = new (std::nothrow) std::uint8_t[SparseSlot];
+    if (swap_table == nullptr || swap_hashes == nullptr || swap_check == nullptr || swap_gather == nullptr) return false;
+    std::memset(swap_table, 0, SwapTableSize * sizeof(std::uint32_t));
+    std::snprintf(swap_folder, sizeof(swap_folder), "%s", folder);
+    (void)mkdir(swap_folder, 0777);
+    char path[sizeof(swap_folder) + 16];
+    std::snprintf(path, sizeof(path), "%s/store.bin", swap_folder);
+    const int store = open(path, O_RDWR | O_CREAT, 0666);
+    std::snprintf(path, sizeof(path), "%s/index.bin", swap_folder);
+    const int index = open(path, O_RDWR | O_CREAT, 0666);
+    struct stat status {};
+    if (store < 0 || index < 0 || fstat(store, &status) != 0) {
+        const int error = errno;
+        if (store >= 0) close(store);
+        if (index >= 0) close(index);
+        // (Off for good at the fifth time only: the first may be a moment's lack of something.)
+        static unsigned refused = 0;
+        if (++refused < 5) return false;
+        errno = error;
+        return SwapOff("its files could not be opened"), false;
+    }
+    // A slot counts when both its hash and all of its bytes are there (a session may have ended
+    // between the two).
+    const std::size_t whole = std::min<std::size_t>(static_cast<std::size_t>(status.st_size) / SwapUnit, SwapMaxSlots);
+    std::size_t hashes = 0;
+    while (hashes < whole * sizeof(std::uint64_t)) {
+        const ssize_t got = pread(index, reinterpret_cast<char*>(swap_hashes) + hashes, whole * sizeof(std::uint64_t) - hashes,
+                                  static_cast<off_t>(hashes));
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) break;
+        hashes += static_cast<std::size_t>(got);
+    }
+    swap_count = swap_carried = static_cast<std::uint32_t>(hashes / sizeof(std::uint64_t));
+    swap_check_slots = 0;
+    swap_check_last = 0xFFFFFFFFu;
+    swap_store_fd = store;
+    swap_index_fd = index;
+    swap_keep_free = std::uint64_t{EnvOr("EDEN_SWAP_KEEP_FREE_MIB", 1024)} << 20;
+    SwapRoom();
+    // A store with less than a quarter of its size left (its size: not what the storage's free
+    // space keeps it to) starts over, here, where no slot of the guest's memory is in it yet, and
+    // not more often than every EDEN_SWAP_START_OVER_HOURS (24; `started` in its folder holds when
+    // it last did). Lichii's stays as it is once it is full and takes only what it holds already
+    // (EDEN_SWAP_START_OVER_HOURS=0 here). A game whose memory differs from one session to the next
+    // (Mario Kart World: a third of what a session sends is found again in the next, and a
+    // 30-minute session adds about 2 GiB) fills 8 GiB in two hours of play, and would have no
+    // store left to send anything new to. A quarter, because a session that starts with less room
+    // than that is one that ends at its next large need. So the storage takes at most the store's
+    // size for each time it starts, and it starts once a day at most.
+    //
+    // That bound is only as good as `started`, so the time goes to the storage first, and for
+    // good, and a store whose time cannot be written does not start over. A time from after now
+    // (the clock was ahead then, or is behind now: a console that has lost its clock) is left as
+    // it is, and the store waits for it to come: taken for a clock that was wrong then, a console
+    // whose clock is wrong at every other launch would start over at every other launch. (Deleting
+    // the folder is the way out of a time far ahead.)
+    bool started_over = false;
     {
-        constexpr std::size_t TestBytes = 16384;
-        char* const pattern = swap_scratch[0];
-        for (std::size_t i = 0; i < TestBytes; ++i) pattern[i] = static_cast<char>((i * 2654435761u) >> 13);
-        tested = pwrite(fd, pattern, TestBytes, 0) == static_cast<ssize_t>(TestBytes) && SwapReadAt(pattern + TestBytes, TestBytes, 0) &&
-                 std::memcmp(pattern, pattern + TestBytes, TestBytes) == 0 && ftruncate(fd, 0) == 0;
+        std::snprintf(path, sizeof(path), "%s/started", swap_folder);
+        const std::uint64_t now = static_cast<std::uint64_t>(time(nullptr));
+        const std::uint64_t every = std::uint64_t{EnvOr("EDEN_SWAP_START_OVER_HOURS", 24)} * 3600;
+        std::uint64_t started = 0;
+        const int mark = open(path, O_RDWR | O_CREAT, 0666);
+        if (mark >= 0 && pread(mark, &started, sizeof(started), 0) != static_cast<ssize_t>(sizeof(started))) started = 0;
+        const auto note = [&]() noexcept {
+            return mark >= 0 && pwrite(mark, &now, sizeof(now), 0) == static_cast<ssize_t>(sizeof(now)) && fsync(mark) == 0;
+        };
+        const bool full = swap_count != 0 && swap_cap - std::min(swap_cap, swap_count) < std::max<std::uint32_t>(swap_cap / 4, 1);
+        // (A store without a time, a new one or one from before there was one: its day starts now.)
+        const bool due = every != 0 && started <= now && (started == 0 || now - started >= every);
+        if (full && due) {
+            // The index first: without it the store is empty, whatever store.bin still holds (its
+            // slots are then written over as the store grows).
+            if (note() && ftruncate(index, 0) == 0) {
+                (void)ftruncate(store, 0);
+                swap_count = swap_carried = 0;
+                started_over = true;
+                SwapRoom();
+            }
+        } else if (started == 0) {
+            (void)note();
+        }
+        if (mark >= 0) close(mark);
     }
-    // Unlinked while open: the storage takes the file back when the app ends, however it ends.
-    const bool unlinked = unlink(path) == 0;
-    if (!tested) {
-        close(fd);
-        swap_fd = -1;
-        return SwapOff("the file did not read back as written"), false;
-    }
-    std::snprintf(swap_ledger_path, sizeof(swap_ledger_path), "%s.ledger", path);
-    SwapLedgerRead();
-
-    swap_units = limit / SwapUnit;
-    swap_hint = 0;
-    for (auto& word : swap_map) word.store(0, std::memory_order_relaxed);
-    swap_used_units.store(0, std::memory_order_relaxed);
-    swap_burst = std::uint64_t{EnvOr("EDEN_SWAP_BURST_MIB", 1024)} << 20;
-    swap_rate = (std::uint64_t{EnvOr("EDEN_SWAP_RATE_MIB_MIN", 128)} << 20) / 60;
-    swap_session_limit = std::uint64_t{EnvOr("EDEN_SWAP_SESSION_MIB", 4096)} << 20;
-    swap_day_limit = std::uint64_t{EnvOr("EDEN_SWAP_DAY_MIB", 8192)} << 20;
+    for (std::uint32_t slot = 0; slot < swap_count; ++slot) SwapTableInsert(swap_hashes[slot], slot);
+    // 1 GiB at once and 8 GiB an hour, where Lichii has 512 MiB and 4 GiB: with those a Mario Kart
+    // World session written to on request only ran out of budget at its second large load (a track's
+    // textures took the 512 MiB at 22 minutes, and the next load, five minutes later, wanted more
+    // than had been refilled) and ended after 29 minutes.
+    swap_burst = static_cast<std::int64_t>(EnvOr("EDEN_SWAP_BURST_MIB", 1024)) << 20;
+    swap_rate = (static_cast<std::int64_t>(EnvOr("EDEN_SWAP_RATE_MIB_HOUR", 8192)) << 20) / 3600;
     swap_tokens = swap_burst;
     swap_token_ns = SwapNow();
     swap_state.store(1, std::memory_order_release);
     char line[400];
     const int n = std::snprintf(line, sizeof(line),
-        "EDEN_SWAP on: %s limit=%zuMiB storage_free=%lluMiB unlinked=%d burst=%lluMiB rate=%lluMiB/min session=%lluMiB "
-        "day=%lluMiB written_today=%lluMiB written_ever=%lluMiB\n", path, limit >> 20,
-        (unsigned long long)(free_bytes == ~std::uint64_t{0} ? 0 : free_bytes >> 20), unlinked ? 1 : 0,
-        (unsigned long long)(swap_burst >> 20), (unsigned long long)(swap_rate * 60 >> 20),
-        (unsigned long long)(swap_session_limit >> 20), (unsigned long long)(swap_day_limit >> 20),
-        (unsigned long long)(swap_day_before >> 20), (unsigned long long)(swap_total_before >> 20));
+        "EDEN_SWAP on: %s holds %lluMiB from earlier sessions%s, may hold %lluMiB; burst=%lldMiB rate=%lldMiB/h\n", swap_folder,
+        (unsigned long long)(std::uint64_t{swap_carried} * SwapUnit >> 20), started_over ? " (it was full and starts over)" : "",
+        (unsigned long long)(std::uint64_t{swap_limit} * SwapUnit >> 20), (long long)(swap_burst >> 20),
+        (long long)((swap_rate * 3600 + (1 << 19)) >> 20));
     if (n > 0) Report(line);
     return true;
 }
-// A slot's 2 MiB from the file into `view` (a fault handler): false when it did not come back as written.
-bool SwapReadSlot(void* view, const PackedSlot& entry) noexcept {
-    const std::uint64_t start = SwapNow();
-    const std::uint64_t offset = std::uint64_t{entry.swap - 1} * SwapUnit;
-    bool ok = false;
-    if (entry.size == SparseSlot) {
-        ok = SwapReadAt(view, SparseSlot, offset);
-    } else if (entry.size <= SwapPackMax) {
-        std::size_t scratch = 0;
-        while (swap_scratch_taken[scratch].test_and_set(std::memory_order_acquire))
-            if (++scratch == SwapScratches) scratch = 0, sched_yield();
-        ok = SwapReadAt(swap_scratch[scratch], entry.size, offset) &&
-             LZ4_decompress_safe(swap_scratch[scratch], static_cast<char*>(view), static_cast<int>(entry.size),
-                                 static_cast<int>(SparseSlot)) == static_cast<int>(SparseSlot);
-        swap_scratch_taken[scratch].clear(std::memory_order_release);
+
+// May `bytes` more be written now (pack_mutex held)? `urgent`: memory was refused, not just short;
+// a quarter of the burst is kept for that.
+bool SwapBudget(std::size_t bytes, bool urgent) noexcept {
+    const std::uint64_t elapsed_ms = (SwapNow() - swap_token_ns) / 1000000ull;
+    swap_tokens = std::min<std::int64_t>(swap_burst, swap_tokens + static_cast<std::int64_t>(elapsed_ms) * swap_rate / 1000);
+    swap_token_ns += elapsed_ms * 1000000ull;
+    if (swap_tokens < static_cast<std::int64_t>(bytes) + (urgent ? 0 : swap_burst / 4)) {
+        swap_denied_rate.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
-    ok = ok && FullHash(reinterpret_cast<std::uintptr_t>(view), SparseSlot) == entry.hash;
+    return true;
+}
+
+// A slot of the store as it is on the storage, to be compared: null when it cannot be read. One
+// slot is read, or the run that follows once the slot after the last one is asked for (the units of
+// a slot of the guest's memory that went together lie in a row: the store only appends).
+const std::uint8_t* SwapHeld(std::uint32_t slot) noexcept {
+    if (slot < swap_check_first || slot - swap_check_first >= swap_check_slots) {
+        const std::uint32_t slots =
+            slot == swap_check_last + 1 ? std::min<std::uint32_t>(static_cast<std::uint32_t>(SwapUnits), swap_count - slot) : 1;
+        swap_check_slots = 0;
+        if (!SwapReadAt(swap_store_fd, swap_check, std::size_t{slots} * SwapUnit, std::uint64_t{slot} * SwapUnit)) return nullptr;
+        swap_check_first = slot;
+        swap_check_slots = slots;
+    }
+    swap_check_last = slot;
+    return swap_check + std::size_t{slot - swap_check_first} * SwapUnit;
+}
+// The slot of the store that holds these 64 KiB, + 1; 0 when none does (pack_mutex held).
+std::uint32_t SwapFind(const std::uint8_t* bytes, std::uint64_t hash) noexcept {
+    unsigned others = 0;
+    for (std::size_t at = hash & (SwapTableSize - 1); swap_table[at] != 0; at = (at + 1) & (SwapTableSize - 1)) {
+        const std::uint32_t slot = swap_table[at] - 1;
+        if (swap_hashes[slot] != hash) continue;
+        const std::uint8_t* const held = SwapHeld(slot);
+        if (held != nullptr && std::memcmp(held, bytes, SwapUnit) == 0) return slot + 1;
+        // (Each of those is a read of the storage. A hash that many slots have and none matches
+        // says nothing: an index gone wrong, see SwapTableInsert.)
+        if (++others == 8) break;
+    }
+    return 0;
+}
+// `count` units in a row, appended as as many slots: the first slot + 1, or 0 when the write failed
+// (pack_mutex held; the budget and the store's room were asked before).
+std::uint32_t SwapAppend(const std::uint8_t* bytes, const std::uint64_t* hashes, std::size_t count) noexcept {
+    const std::uint32_t first = swap_count;
+    const std::uint64_t start = SwapNow();
+    // The bytes, then their hashes: a slot counts when both are there.
+    const bool ok = SwapWriteAt(swap_store_fd, bytes, count * SwapUnit, std::uint64_t{first} * SwapUnit) &&
+                    SwapWriteAt(swap_index_fd, hashes, count * sizeof(std::uint64_t), std::uint64_t{first} * sizeof(std::uint64_t));
+    swap_write_ns.fetch_add(SwapNow() - start, std::memory_order_relaxed);
+    if (!ok) return 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        swap_hashes[first + i] = hashes[i];
+        SwapTableInsert(hashes[i], first + static_cast<std::uint32_t>(i));
+    }
+    swap_count += static_cast<std::uint32_t>(count);
+    swap_tokens -= static_cast<std::int64_t>(count * SwapUnit);
+    swap_written.fetch_add(count * SwapUnit, std::memory_order_relaxed);
+    swap_appended.fetch_add(count, std::memory_order_relaxed);
+    swap_appends.fetch_add(1, std::memory_order_relaxed);
+    return first + 1;
+}
+
+// (pack_mutex held) The budget or the store's room refused a slot's writes: the caller stops asking for more.
+bool swap_refused = false;
+// How a slot may go to the store: only if that writes nothing (all of it is there already); with
+// writes while the budget keeps its part for failed allocations; with writes down to its last byte.
+enum class SwapWrites { None, Budget, Urgent };
+// The 2 MiB at `at` (readable, and written by no one meanwhile) into the store: `units` gets the
+// slot + 1 of each of its 64 KiB, SwapZeroUnit for those of zeroes. False when the slot stays as
+// it is: it needs writes that `writes`, the budget or the store's room do not allow, or one failed
+// (swapping then ends). pack_mutex held.
+bool SwapOutSlot(std::uintptr_t at, std::uint32_t* units, SwapWrites writes) noexcept {
+    const auto* const bytes = reinterpret_cast<const std::uint8_t*>(at);
+    std::uint64_t hashes[SwapUnits];
+    std::size_t fresh = 0, found = 0, zeroes = 0;
+    for (std::size_t unit = 0; unit < SwapUnits; ++unit) {
+        const std::uint8_t* const here = bytes + unit * SwapUnit;
+        if (SwapUnitZero(here)) {
+            units[unit] = SwapZeroUnit;
+            ++zeroes;
+            continue;
+        }
+        hashes[unit] = SwapUnitHash(here);
+        units[unit] = SwapFind(here, hashes[unit]);
+        if (units[unit] != 0) {
+            ++found;
+            continue;
+        }
+        if (writes == SwapWrites::None) {
+            swap_missed.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        ++fresh;
+    }
+    if (fresh != 0) {
+        if (swap_count + fresh > swap_limit) {
+            swap_full.fetch_add(1, std::memory_order_relaxed);
+            swap_refused = true;
+            return false;
+        }
+        if (!SwapBudget(fresh * SwapUnit, writes == SwapWrites::Urgent)) {
+            swap_refused = true;
+            return false;
+        }
+        // The new units go in one write, side by side in the slot's order. Each run of them used to
+        // be a write of its own, and a write costs 5 ms whatever its size: late in an hour of Mario
+        // Kart World, when the store has most units of a slot and the new ones lie scattered
+        // between them, 971 MiB took 85 s to write (11 MiB a second, where whole slots go at 190),
+        // with frames of 10 to 29 s while a load waited for them.
+        std::uint64_t gathered[SwapUnits];
+        std::uint8_t place[SwapUnits], twin[SwapUnits]; // of a new unit: its place in the write; the unit it repeats
+        std::size_t count = 0;
+        for (std::size_t unit = 0; unit < SwapUnits; ++unit) {
+            twin[unit] = 0xFF;
+            if (units[unit] != 0) continue;
+            // Two units of this slot with the same bytes: the second is the first's slot.
+            for (std::size_t earlier = 0; earlier < unit; ++earlier) {
+                if (units[earlier] != 0 || twin[earlier] != 0xFF || hashes[earlier] != hashes[unit] ||
+                    std::memcmp(bytes + earlier * SwapUnit, bytes + unit * SwapUnit, SwapUnit) != 0)
+                    continue;
+                twin[unit] = static_cast<std::uint8_t>(earlier);
+                break;
+            }
+            if (twin[unit] != 0xFF) continue;
+            place[unit] = static_cast<std::uint8_t>(count);
+            gathered[count] = hashes[unit];
+            std::memcpy(swap_gather + count * SwapUnit, bytes + unit * SwapUnit, SwapUnit);
+            ++count;
+        }
+        const std::uint32_t first = SwapAppend(swap_gather, gathered, count);
+        if (first == 0) {
+            SwapOff("a write failed");
+            return false;
+        }
+        for (std::size_t unit = 0; unit < SwapUnits; ++unit)
+            if (units[unit] == 0 && twin[unit] == 0xFF) units[unit] = first + place[unit];
+        for (std::size_t unit = 0; unit < SwapUnits; ++unit)
+            if (twin[unit] != 0xFF) units[unit] = units[twin[unit]];
+    }
+    swap_found.fetch_add(found, std::memory_order_relaxed);
+    swap_zero_units.fetch_add(zeroes, std::memory_order_relaxed);
+    return true;
+}
+
+// A slot's 2 MiB from the store into `view` (a fault handler: no lock, the store's slots never
+// change): false when they did not come back as they went.
+bool SwapReadSlot(void* view, const std::uint32_t* units, std::uint64_t hash) noexcept {
+    const std::uint64_t start = SwapNow();
+    auto* const to = static_cast<std::uint8_t*>(view);
+    bool ok = true;
+    for (std::size_t unit = 0; unit < SwapUnits && ok;) {
+        if (units[unit] == SwapZeroUnit) {
+            std::memset(to + unit * SwapUnit, 0, SwapUnit);
+            ++unit;
+            continue;
+        }
+        // Units that went together lie in a row in the store: read in one call.
+        std::size_t end = unit + 1;
+        while (end < SwapUnits && units[end] != SwapZeroUnit && units[end] == units[end - 1] + 1) ++end;
+        ok = units[unit] != 0 &&
+             SwapReadAt(swap_store_fd, to + unit * SwapUnit, (end - unit) * SwapUnit, std::uint64_t{units[unit] - 1} * SwapUnit);
+        unit = end;
+    }
+    ok = ok && FullHash(reinterpret_cast<std::uintptr_t>(view), SparseSlot) == hash;
     const std::uint64_t took = SwapNow() - start;
     swap_reads.fetch_add(1, std::memory_order_relaxed);
     swap_read_ns.fetch_add(took, std::memory_order_relaxed);
@@ -637,12 +751,15 @@ bool SwapReadSlot(void* view, const PackedSlot& entry) noexcept {
     return ok;
 }
 
-// Forgets a slot's packed data, in the store or in the swap file (the slot is locked).
+// Per slot of the guest's range, the store's slot + 1 of each of its units while the store has its
+// bytes (PackedSlot::swap; made with the packed table, under the slot's lock afterwards).
+std::uint32_t* swap_units = nullptr;
+
+// Forgets a slot's packed data, in the packed store or in the swap store (the slot is locked).
 void ForgetPacked(std::size_t slot) noexcept {
     PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
     if (table == nullptr) return;
-    if (table[slot].swap != 0) {
-        SwapFree(table[slot].swap - 1, SwapUnitsOf(table[slot].size));
+    if (table[slot].swap != 0) { // (its units stay where they are: the store is found by contents)
         swap_slots.fetch_sub(1, std::memory_order_relaxed);
     } else if (table[slot].data != nullptr) {
         packed_count.fetch_sub(1, std::memory_order_relaxed);
@@ -651,7 +768,7 @@ void ForgetPacked(std::size_t slot) noexcept {
     }
     table[slot] = {};
 }
-// The swap file holds the slot's bytes (a Packed slot's only copy, or a Clean or Idle slot's second).
+// The swap store holds the slot's bytes (a Packed slot's only copy, or a Clean or Idle slot's second).
 bool InSwap(std::size_t slot) noexcept {
     PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
     return table != nullptr && table[slot].swap != 0;
@@ -659,62 +776,37 @@ bool InSwap(std::size_t slot) noexcept {
 
 #ifndef PS5_NATIVE
 extern std::mutex pack_mutex;
-// The host's check (below): the swap file as a session that has not started finds it.
+// The host's check (below): the store as a session that has not started finds it.
 void SwapCheckReset() noexcept {
-    if (swap_fd >= 0) close(swap_fd);
-    swap_fd = -1;
+    if (swap_store_fd >= 0) close(swap_store_fd);
+    if (swap_index_fd >= 0) close(swap_index_fd);
+    swap_store_fd = swap_index_fd = -1;
+    swap_count = swap_limit = swap_cap = swap_carried = 0;
     swap_state.store(0, std::memory_order_release);
     swap_off_why.store("not needed yet", std::memory_order_release);
-    swap_written.store(0, std::memory_order_relaxed);
-    swap_ledger_done = 0;
-    swap_ledger_path[0] = 0;
-}
-// What the ledger says was written on its day: -1 without a ledger.
-long long SwapCheckLedgerDay(const char* ledger) noexcept {
-    char record[96] = {};
-    const int fd = open(ledger, O_RDONLY);
-    if (fd < 0) return -1;
-    const ssize_t got = read(fd, record, sizeof(record) - 1);
-    close(fd);
-    unsigned long long day = 0, day_bytes = 0, total = 0;
-    if (got <= 0 || std::sscanf(record, "EGSWAP1 day=%llu day_bytes=%llu total_bytes=%llu", &day, &day_bytes, &total) != 3) return -1;
-    return static_cast<long long>(day_bytes);
-}
-// A slot's bytes to the file as PackSlot writes them: its entry, or one with swap 0 when the budget
-// or the file said no.
-PackedSlot SwapCheckWrite(const char* slot, const char* stored, std::size_t size, bool urgent) noexcept {
-    if (!SwapBudget(size, urgent)) return {};
-    const std::size_t unit = SwapAlloc(SwapUnitsOf(size));
-    if (unit == SwapMaxUnits) return {};
-    const std::uint64_t hash = FullHash(reinterpret_cast<std::uintptr_t>(slot), SparseSlot);
-    if (!SwapWrite(stored, size, std::uint64_t{unit} * SwapUnit)) {
-        SwapFree(unit, SwapUnitsOf(size));
-        return {};
-    }
-    return {nullptr, static_cast<std::uint32_t>(size), static_cast<std::uint32_t>(unit + 1), hash};
+    for (auto* counter : {&swap_written, &swap_appended, &swap_found, &swap_zero_units}) counter->store(0, std::memory_order_relaxed);
 }
 } // namespace
 
-// The host's check of the swap file's own parts (headless/memory_check.cpp): the file's test, a
-// slot's way there and back (as it is, and compressed), the hash that catches a changed byte, the
-// budget's limits, and the ledger over sessions that end in order, without warning, and after
-// midnight. `folder`: where the file may be made. Returns 0, or the number of the step that failed.
+// The host's check of the swap store's own parts (headless/memory_check.cpp): a slot there and back,
+// its units found again without a write (in the same session and in the next), units of zeroes and
+// twins, a changed byte in the store, the budget and its refill, the store's limit and the
+// storage's, an index ahead of its store, and when the store starts over. `folder`: where the store
+// may be made. Returns 0, or the number of the step that failed.
 extern "C" int eden_swap_check(const char* folder) noexcept {
-    char path[400], ledger[420];
-    // (The port's LZ4 symbols are weak: a program that checks this links LZ4 itself.)
-    if (&LZ4_compress_default == nullptr || &LZ4_decompress_safe == nullptr || &LZ4_compressBound == nullptr) return 100;
-    if (std::snprintf(path, sizeof(path), "%s/guest-memory.swap", folder) >= static_cast<int>(sizeof(path))) return 1;
-    std::snprintf(ledger, sizeof(ledger), "%s.ledger", path);
-    unlink(ledger);
-    const auto session = [&](const char* burst, const char* per_session, const char* per_day) noexcept {
+    char path[400], store[420], index[420];
+    if (std::snprintf(path, sizeof(path), "%s/swap", folder) >= static_cast<int>(sizeof(path))) return 1;
+    std::snprintf(store, sizeof(store), "%s/store.bin", path);
+    std::snprintf(index, sizeof(index), "%s/index.bin", path);
+    const auto session = [&](const char* limit_mib, const char* burst_mib, const char* start_over_hours = "0",
+                             const char* rate_mib_hour = "0", const char* keep_free_mib = "0") noexcept {
         SwapCheckReset();
-        setenv("EDEN_SWAP_PATH", path, 1);
-        setenv("EDEN_SWAP_MIB", "64", 1);
-        setenv("EDEN_SWAP_KEEP_FREE_MIB", "0", 1);
-        setenv("EDEN_SWAP_RATE_MIB_MIN", "0", 1);
-        setenv("EDEN_SWAP_BURST_MIB", burst, 1);
-        setenv("EDEN_SWAP_SESSION_MIB", per_session, 1);
-        setenv("EDEN_SWAP_DAY_MIB", per_day, 1);
+        setenv("EDEN_SWAP_START_OVER_HOURS", start_over_hours, 1);
+        setenv("EDEN_SWAP_DIR", path, 1);
+        setenv("EDEN_SWAP_MIB", limit_mib, 1);
+        setenv("EDEN_SWAP_KEEP_FREE_MIB", keep_free_mib, 1);
+        setenv("EDEN_SWAP_RATE_MIB_HOUR", rate_mib_hour, 1);
+        setenv("EDEN_SWAP_BURST_MIB", burst_mib, 1);
         return SwapStart();
     };
     const std::lock_guard lock{pack_mutex};
@@ -724,79 +816,164 @@ extern "C" int eden_swap_check(const char* folder) noexcept {
         if (!value && failed == 0) failed = step;
         return value;
     };
-    std::vector<char> slot(SparseSlot), back(SparseSlot), packed(static_cast<std::size_t>(LZ4_compressBound(static_cast<int>(SparseSlot))));
+    const auto file_size = [](const char* name) noexcept -> long long {
+        struct stat status {};
+        return stat(name, &status) == 0 ? static_cast<long long>(status.st_size) : -1;
+    };
+    // A slot of the guest's memory: unit 0 of zeroes, unit 5 the same bytes as unit 4, the rest random.
+    std::vector<std::uint8_t> slot(SparseSlot), back(SparseSlot);
     std::uint64_t seed = 0x9e3779b97f4a7c15ull;
-    for (char& byte : slot) byte = static_cast<char>((seed = seed * 6364136223846793005ull + 1442695040888963407ull) >> 56);
-    const std::uint64_t mib = std::uint64_t{1} << 20;
+    for (std::uint8_t& byte : slot) byte = static_cast<std::uint8_t>((seed = seed * 6364136223846793005ull + 1442695040888963407ull) >> 56);
+    std::memset(slot.data(), 0, SwapUnit);
+    std::memcpy(slot.data() + 5 * SwapUnit, slot.data() + 4 * SwapUnit, SwapUnit);
+    const auto at = reinterpret_cast<std::uintptr_t>(slot.data());
+    const std::uint64_t whole = FullHash(at, SparseSlot);
+    std::uint32_t units[SwapUnits], again[SwapUnits];
 
-    // Session 1: 8 MiB at once, no refill. The file is unlinked while open; no ledger before a write.
-    if (!expect(session("8", "64", "64"))) return failed;                                       // 2
-    expect(access(path, F_OK) != 0 && access(ledger, F_OK) != 0);                               // 3
-    // A slot that does not compress, there and back; the ledger was charged first, a step ahead.
-    const PackedSlot raw = SwapCheckWrite(slot.data(), slot.data(), SparseSlot, true);
-    expect(raw.swap != 0 && SwapReadSlot(back.data(), raw) && std::memcmp(slot.data(), back.data(), SparseSlot) == 0); // 4
-    expect(SwapCheckLedgerDay(ledger) == static_cast<long long>(SwapLedgerStep));                // 5
-    // A slot LZ4 makes smaller, there and back; a byte changed in the file is caught.
-    std::memset(slot.data(), 0, SparseSlot / 2);
-    const int size = LZ4_compress_default(slot.data(), packed.data(), static_cast<int>(SparseSlot), static_cast<int>(packed.size()));
-    expect(size > 0 && static_cast<std::size_t>(size) <= SwapPackMax);                           // 6
-    const PackedSlot small = SwapCheckWrite(slot.data(), packed.data(), static_cast<std::size_t>(size), true);
-    std::memset(back.data(), 0x55, SparseSlot);
-    expect(small.swap != 0 && SwapReadSlot(back.data(), small) && std::memcmp(slot.data(), back.data(), SparseSlot) == 0); // 7
-    const off_t spot = static_cast<off_t>(std::uint64_t{small.swap - 1} * SwapUnit + 4096);
-    const char changed = static_cast<char>(~packed[4096]);
-    expect(pwrite(swap_fd, &changed, 1, spot) == 1 && !SwapReadSlot(back.data(), small));         // 8
-    expect(pwrite(swap_fd, &packed[4096], 1, spot) == 1 && SwapReadSlot(back.data(), small));     // 9
-    // Units given back are found again.
-    const std::uint64_t used = swap_used_units.load(std::memory_order_relaxed);
-    SwapFree(raw.swap - 1, SwapUnitsOf(SparseSlot));
-    expect(swap_used_units.load(std::memory_order_relaxed) == used - SwapUnitsOf(SparseSlot));    // 10
-    // The burst: about 3 MiB of 8 are gone. One more slot may go either way; after it a quarter of the
-    // burst is left for when memory was refused; after one more nothing is.
-    expect(SwapBudget(SparseSlot, false) && SwapCheckWrite(slot.data(), slot.data(), SparseSlot, false).swap != 0); // 11
-    expect(!SwapBudget(SparseSlot, false) && SwapBudget(SparseSlot, true));                       // 12
-    expect(SwapCheckWrite(slot.data(), slot.data(), SparseSlot, true).swap != 0 && !SwapBudget(SparseSlot, true)); // 13
-    // The session ends in order: the ledger has the exact count.
-    const std::uint64_t first = swap_written.load(std::memory_order_relaxed);
-    SwapLedgerFlush();
-    expect(first == 3 * SparseSlot + static_cast<std::uint64_t>(size) && SwapCheckLedgerDay(ledger) == static_cast<long long>(first)); // 14
+    // Session 1: an empty store, 8 MiB at once and no refill.
+    if (!expect(session("64", "8"))) return failed;                                               // 2
+    expect(swap_count == 0 && file_size(store) == 0 && file_size(index) == 0);                    // 3
+    // Nothing of it is there yet: it does not go without a write, and goes with 30 of them.
+    expect(!SwapOutSlot(at, units, SwapWrites::None) && swap_count == 0);                         // 4
+    expect(SwapOutSlot(at, units, SwapWrites::Urgent) && swap_count == 30 && units[0] == SwapZeroUnit &&
+           units[5] == units[4] && swap_written.load() == 30 * SwapUnit);                         // 5
+    expect(file_size(store) == static_cast<long long>(30 * SwapUnit) && file_size(index) == 30 * 8);  // 6
+    expect(SwapReadSlot(back.data(), units, whole) && std::memcmp(slot.data(), back.data(), SparseSlot) == 0); // 7
+    // The same bytes again: found, nothing written, the same slots (the twin's too).
+    expect(SwapOutSlot(at, again, SwapWrites::None) && swap_count == 30 && std::memcmp(units, again, sizeof(units)) == 0 &&
+           swap_found.load() == 31);                                                              // 8
+    // One unit changed: one slot more; the old unit's slot stays as it was.
+    slot[7 * SwapUnit + 100] ^= 0xff;
+    expect(SwapOutSlot(at, again, SwapWrites::Urgent) && swap_count == 31 && again[7] == 31 && again[8] == units[8]); // 9
+    expect(SwapReadSlot(back.data(), again, FullHash(at, SparseSlot)) && std::memcmp(slot.data(), back.data(), SparseSlot) == 0); // 10
+    slot[7 * SwapUnit + 100] ^= 0xff;
+    expect(SwapReadSlot(back.data(), units, whole) && std::memcmp(slot.data(), back.data(), SparseSlot) == 0); // 11
+    // The budget: 128 units, of which 31 are gone and a quarter (32) is kept for failed allocations.
+    std::vector<std::uint8_t> other(SparseSlot);
+    for (std::uint8_t& byte : other) byte = static_cast<std::uint8_t>((seed = seed * 6364136223846793005ull + 1442695040888963407ull) >> 56);
+    const auto other_at = reinterpret_cast<std::uintptr_t>(other.data());
+    const auto change = [&other]() noexcept {
+        for (std::uint8_t& byte : other) byte = static_cast<std::uint8_t>(byte + 1);
+    };
+    expect(SwapOutSlot(other_at, again, SwapWrites::Budget) && swap_count == 63);                 // 12
+    change();
+    expect(SwapOutSlot(other_at, again, SwapWrites::Budget) && swap_count == 95);                 // 13
+    change();
+    expect(!SwapOutSlot(other_at, again, SwapWrites::Budget) && swap_count == 95 && swap_denied_rate.load() != 0); // 14
+    expect(SwapOutSlot(other_at, again, SwapWrites::Urgent) && swap_count == 127);                // 15
+    change();
+    expect(!SwapOutSlot(other_at, again, SwapWrites::Urgent) && swap_count == 127);               // 16
 
-    // Session 2 starts from the ledger: of 16 MiB a day, what session 1 wrote is gone.
-    if (!expect(session("64", "64", "16"))) return failed;                                       // 15
-    expect(swap_day_before == first && swap_total_before == first);                              // 16
-    std::size_t wrote = 0;
-    while (wrote < 16 && SwapCheckWrite(slot.data(), slot.data(), SparseSlot, true).swap != 0) ++wrote;
-    expect(wrote == (16 * mib - first) / SparseSlot && swap_denied_cap.load(std::memory_order_relaxed) != 0); // 17
-    // It ends without warning: the ledger keeps the charge, no less than what was written.
-    const std::uint64_t second = swap_written.load(std::memory_order_relaxed);
-    expect(SwapCheckLedgerDay(ledger) >= static_cast<long long>(first + second));                 // 18
+    // Session 2 finds session 1's slots: the first slot goes again without a write.
+    if (!expect(session("64", "8"))) return failed;                                               // 17
+    expect(swap_count == 127 && swap_carried == 127);                                             // 18
+    expect(SwapOutSlot(at, again, SwapWrites::None) && swap_count == 127 && std::memcmp(units, again, sizeof(units)) == 0 &&
+           swap_written.load() == 0);                                                             // 19
+    // A byte of the store changed behind its back: a slot read back with it is refused, and the
+    // unit no longer passes for the slot's (it is appended anew).
+    const std::uint8_t wrong = static_cast<std::uint8_t>(~slot[9 * SwapUnit + 10]);
+    expect(pwrite(swap_store_fd, &wrong, 1, static_cast<off_t>(std::uint64_t{units[9] - 1} * SwapUnit + 10)) == 1); // 20
+    swap_check_slots = 0; // (what was read to compare is from before the change)
+    expect(!SwapReadSlot(back.data(), units, whole));                                             // 21
+    expect(SwapOutSlot(at, again, SwapWrites::Urgent) && swap_count == 128 && again[9] == 128 && again[10] == units[10]); // 22
+    expect(SwapReadSlot(back.data(), again, whole) && std::memcmp(slot.data(), back.data(), SparseSlot) == 0); // 23
 
-    // Session 3: 4 MiB a session.
-    unlink(ledger);
-    if (!expect(session("64", "4", "64"))) return failed;                                        // 19
-    expect(swap_day_before == 0);                                                                // 20
-    wrote = 0;
-    while (wrote < 16 && SwapCheckWrite(slot.data(), slot.data(), SparseSlot, true).swap != 0) ++wrote;
-    expect(wrote == 2);                                                                          // 21
-    // Session 4 runs past midnight: 4 MiB a day are used up, and the new day starts from nothing.
-    unlink(ledger);
-    if (!expect(session("64", "64", "4"))) return failed;                                        // 22
-    wrote = 0;
-    while (wrote < 16 && SwapCheckWrite(slot.data(), slot.data(), SparseSlot, true).swap != 0) ++wrote;
-    expect(wrote == 2);                                                                          // 23
-    --swap_day; // (as if the session had begun the day before)
-    expect(SwapCheckWrite(slot.data(), slot.data(), SparseSlot, true).swap != 0 &&
-           SwapDayBytes(swap_written.load(std::memory_order_relaxed)) == SparseSlot);            // 24
-    // A ledger that cannot be written: nothing goes to the file, and swapping ends.
-    if (!expect(session("64", "64", "64"))) return failed;                                       // 25
-    std::snprintf(swap_ledger_path, sizeof(swap_ledger_path), "%s/no-such-folder/ledger", folder);
-    const std::uint64_t before = swap_written.load(std::memory_order_relaxed);
-    expect(SwapCheckWrite(slot.data(), slot.data(), SparseSlot, true).swap == 0 &&
-           swap_written.load(std::memory_order_relaxed) == before && !SwapOn());                 // 26
+    // Session 3: the store may hold 8 MiB and holds as much. What is there is found, nothing new goes.
+    if (!expect(session("8", "64"))) return failed;                                               // 24
+    expect(swap_count == 128 && swap_limit == 128 && swap_cap == 128);                            // 25
+    expect(SwapOutSlot(at, again, SwapWrites::None));                                             // 26
+    change();
+    expect(!SwapOutSlot(other_at, again, SwapWrites::Urgent) && swap_count == 128 && swap_full.load() != 0); // 27
+
+    // An index a power cut left ahead of its store (a hash more than the store has slots): the slot
+    // does not count.
     SwapCheckReset();
-    unlink(ledger);
-    for (const char* name : {"EDEN_SWAP_PATH", "EDEN_SWAP_MIB", "EDEN_SWAP_KEEP_FREE_MIB", "EDEN_SWAP_RATE_MIB_MIN",
-                             "EDEN_SWAP_BURST_MIB", "EDEN_SWAP_SESSION_MIB", "EDEN_SWAP_DAY_MIB"})
+    const std::uint64_t stray = 0x1234;
+    const int fd = open(index, O_WRONLY);
+    expect(fd >= 0 && pwrite(fd, &stray, sizeof(stray), 128 * 8) == sizeof(stray));                // 28
+    if (fd >= 0) close(fd);
+    if (!expect(session("64", "64"))) return failed;                                              // 29
+    expect(swap_count == 128);                                                                    // 30
+    // A store that has reached its size starts over, once a day at most; one with room left does not.
+    char mark[420];
+    std::snprintf(mark, sizeof(mark), "%s/started", path);
+    // (`started`: set to so many seconds from now, and how far from now it is.)
+    const auto set_started = [&](long long from_now) noexcept {
+        const std::uint64_t then = static_cast<std::uint64_t>(static_cast<long long>(time(nullptr)) + from_now);
+        const int file = open(mark, O_WRONLY);
+        const bool done = file >= 0 && pwrite(file, &then, sizeof(then), 0) == sizeof(then);
+        if (file >= 0) close(file);
+        return done;
+    };
+    const auto started_from_now = [&]() noexcept -> long long {
+        std::uint64_t then = 0;
+        const int file = open(mark, O_RDONLY);
+        const bool got = file >= 0 && pread(file, &then, sizeof(then), 0) == sizeof(then);
+        if (file >= 0) close(file);
+        return got ? static_cast<long long>(then) - static_cast<long long>(time(nullptr)) : 1ll << 40;
+    };
+    if (!expect(session("64", "64", "24"))) return failed;                                        // 31
+    expect(swap_count == 128 && started_from_now() <= 0 && started_from_now() >= -5);             // 32 (its day starts with it)
+    if (!expect(session("8", "64", "24"))) return failed;                                         // 33
+    expect(swap_count == 128 && file_size(mark) == 8);                                            // 34 (its day is not over)
+    expect(set_started(-25 * 3600));                                                              // 35
+    if (!expect(session("8", "64", "24"))) return failed;                                         // 36
+    expect(swap_count == 0 && file_size(store) == 0 && file_size(index) == 0);                    // 37
+    expect(started_from_now() <= 0 && started_from_now() >= -5);                                  // 38 (and when is on the storage)
+    expect(SwapOutSlot(at, again, SwapWrites::Urgent) && swap_count == 30 &&
+           SwapReadSlot(back.data(), again, whole) && std::memcmp(slot.data(), back.data(), SparseSlot) == 0); // 39
+    // Less than a quarter of its size left is what starts over: 30 slots of 64 stay, 30 of 32 do not.
+    expect(set_started(-25 * 3600));                                                              // 40
+    if (!expect(session("4", "64", "24"))) return failed;                                         // 41
+    expect(swap_count == 30 && SwapOutSlot(at, again, SwapWrites::None));                         // 42
+    if (!expect(session("2", "64", "24"))) return failed;                                         // 43
+    expect(swap_count == 0 && file_size(store) == 0 && file_size(index) == 0);                    // 44
+    // Never, with EDEN_SWAP_START_OVER_HOURS=0 (the store then takes only what it holds, as Lichii's does).
+    expect(SwapOutSlot(at, again, SwapWrites::Urgent) && swap_count == 30 && set_started(-25 * 3600)); // 45
+    if (!expect(session("2", "64", "0"))) return failed;                                          // 46
+    expect(swap_count == 30 && SwapOutSlot(at, again, SwapWrites::None));                         // 47
+    // Nor with a time from after now (a clock that was ahead, or is behind): the store waits, and the time stays.
+    expect(set_started(3600));                                                                    // 48
+    if (!expect(session("2", "64", "24"))) return failed;                                         // 49
+    expect(swap_count == 30 && started_from_now() > 3500);                                        // 50
+    // Nor without a time that can be written: `started` is a folder here.
+    expect(unlink(mark) == 0 && mkdir(mark, 0777) == 0);                                          // 51
+    if (!expect(session("2", "64", "24"))) return failed;                                         // 52
+    expect(swap_count == 30 && rmdir(mark) == 0);                                                 // 53
+    // A storage with nothing free beyond what is kept free: the store does not grow, and what it holds is found.
+    if (!expect(session("64", "64", "0", "0", "1000000000"))) return failed;                      // 54
+    const std::uint64_t full_before = swap_full.load();
+    change();
+    expect(swap_limit == 30 && SwapOutSlot(at, again, SwapWrites::None) &&
+           !SwapOutSlot(other_at, again, SwapWrites::Urgent) && swap_count == 30 && swap_full.load() > full_before); // 55
+    // The budget fills up again: 2 MiB at once, 10 MiB a second.
+    if (!expect(session("64", "2", "0", "36000"))) return failed;                                 // 56
+    change();
+    const std::uint64_t spent_at = SwapNow();
+    expect(SwapOutSlot(other_at, again, SwapWrites::Urgent) && swap_count == 62);                 // 57
+    change();
+    const bool at_once = SwapOutSlot(other_at, again, SwapWrites::Urgent);
+    expect(!at_once || SwapNow() - spent_at >= 150'000'000ull);                                   // 58 (2 MiB more take 200 ms)
+    usleep(400'000);
+    change();
+    expect(SwapOutSlot(other_at, again, SwapWrites::Urgent));                                     // 59
+    // New units that do not lie side by side go in one write all the same, in the slot's order.
+    if (!expect(session("64", "64"))) return failed;                                              // 60
+    expect(SwapOutSlot(at, units, SwapWrites::None));                                             // 61
+    for (const std::size_t unit : {std::size_t{3}, std::size_t{12}, std::size_t{25}}) slot[unit * SwapUnit + 7] ^= 0x55;
+    const std::uint32_t count_before = swap_count;
+    const std::uint64_t appends_before = swap_appends.load();
+    expect(SwapOutSlot(at, again, SwapWrites::Urgent) && swap_count == count_before + 3 &&
+           swap_appends.load() == appends_before + 1 && again[3] == count_before + 1 && again[12] == count_before + 2 &&
+           again[25] == count_before + 3 && again[4] == units[4]);                                // 62
+    expect(SwapReadSlot(back.data(), again, FullHash(at, SparseSlot)) && std::memcmp(slot.data(), back.data(), SparseSlot) == 0); // 63
+    unlink(mark);
+    SwapCheckReset();
+    unlink(store);
+    unlink(index);
+    rmdir(path);
+    for (const char* name : {"EDEN_SWAP_DIR", "EDEN_SWAP_MIB", "EDEN_SWAP_KEEP_FREE_MIB", "EDEN_SWAP_RATE_MIB_HOUR", "EDEN_SWAP_BURST_MIB",
+                             "EDEN_SWAP_START_OVER_HOURS"})
         unsetenv(name);
     return failed;
 }
@@ -806,13 +983,13 @@ namespace {
 // ---- Idle slots: which slots nothing touches ----
 // Packing used to choose slots by when they were last written (a sampled hash each pass). Reads are
 // not seen that way: more than half of the slots packed in a Mario Kart World session were read and
-// unpacked again (packs=1252 unpacks=724), a block and 2 MiB of LZ4 each time. For the swap file
+// unpacked again (packs=1252 unpacks=724), a block and 2 MiB of LZ4 each time. For the swap store
 // that would be a write each time. So while the pool is short the scanner takes all access away
 // from slots for a while (Idle: the block stays, mprotect only). A slot the game or the emulator
 // touches faults once and has its access back (a signal and an mprotect); it is then left alone
 // for IdleBackoff seconds, twice as long each time it was woken or unpacked. A slot still Idle
 // after IdleSeconds is one nothing reads or writes: those are packed, the longest idle first, and
-// only those go to the swap file. EDEN_CRAM_IDLE=0 goes back to choosing by writes (and no swap).
+// only those go to the swap store. EDEN_CRAM_IDLE=0 goes back to choosing by writes (and no swap).
 bool IdleEnabled() noexcept {
     static const bool on = [] {
         const char* value = std::getenv("EDEN_CRAM_IDLE");
@@ -823,14 +1000,14 @@ bool IdleEnabled() noexcept {
 std::uint32_t* idle_since = nullptr;                    // per slot: when it was made Idle (s)
 // Per slot: how often it was written again after it had stayed unwritten for RecycleQuietSeconds or
 // more. That is memory the game reuses (a pool it loads the next track into): untouched for
-// minutes, it looks like the best there is to take, and what is written to the file for it is
+// minutes, it looks like the best there is to take, and what is written to the store for it is
 // thrown away at the game's next write. In a 14-minute Mario Kart World session 684 of 979 slots
-// written to the file ended that way, whether they had been unwritten for one minute (79%) or for
+// written to the store ended that way, whether they had been unwritten for one minute (79%) or for
 // five to ten (61%): how long a slot has been unwritten does not tell the two kinds apart, its
 // history does. Counted for free by the scanner, which sees a slot's sampled hash change
-// (ColdPass), and by the write that drops a slot's copy in the file (MakeDirty, under the slot's
+// (ColdPass), and by the write that drops a slot's copy in the store (MakeDirty, under the slot's
 // lock; rewrite_noted keeps the scanner from counting that write again). Slots never counted go
-// to the file first. The others go only when a request for memory would otherwise get nothing
+// to the store first. The others go only when a request for memory would otherwise get nothing
 // (RecoverMemory): they used to go once they had stayed unwritten for 2, 4, 8, then 16 minutes,
 // and of the slots written that way after one and two such counts 74% and 83% were thrown away
 // by the game's next write.
@@ -845,19 +1022,21 @@ void NoteRewritten(std::size_t slot) noexcept {
 unsigned Rewritten(std::size_t slot) noexcept {
     return swap_rewritten != nullptr ? swap_rewritten[slot].load(std::memory_order_relaxed) : 0;
 }
-// What a slot was when it went to the file (per slot: SwapAgeClass in bits 0-2, how often it had
-// been written again in bits 4-5), and how many of each kind were written and then had their copy
-// dropped by a write (the report's EDEN_SWAP_AGES line).
+// What a slot was when it went to the swap store with a write (per slot: SwapAgeClass in bits 0-2,
+// how often it had been written again in bits 4-5; bit 6 for one that went without a write, all of
+// it being there), and how many of each kind were written and then dropped by a write of the game's
+// (the report's EDEN_SWAP_AGES line).
 std::uint8_t* swap_age_class = nullptr;
 std::atomic<std::uint32_t> swap_age_written[6], swap_age_dropped[6], swap_kind_written[4], swap_kind_dropped[4];
 unsigned SwapAgeClass(std::uint32_t unwritten_s) noexcept {
     return unwritten_s < 30 ? 0 : unwritten_s < 60 ? 1 : unwritten_s < 120 ? 2 : unwritten_s < 300 ? 3 : unwritten_s < 600 ? 4 : 5;
 }
-// A slot goes to the file (pack_mutex held): what it is then.
-void NoteSwapWrite(std::size_t slot, std::uint32_t unwritten_s) noexcept {
+// A slot goes to the swap store (pack_mutex held): what it is then, and whether any of it was written.
+void NoteSwapWrite(std::size_t slot, std::uint32_t unwritten_s, bool wrote) noexcept {
     if (swap_age_class == nullptr) return;
     const unsigned age = SwapAgeClass(unwritten_s), kind = std::min<unsigned>(Rewritten(slot), 3);
-    swap_age_class[slot] = static_cast<std::uint8_t>(age | kind << 4);
+    swap_age_class[slot] = static_cast<std::uint8_t>(age | kind << 4 | (wrote ? 0 : 0x40));
+    if (!wrote) return;
     swap_age_written[age].fetch_add(1, std::memory_order_relaxed);
     swap_kind_written[kind].fetch_add(1, std::memory_order_relaxed);
 }
@@ -882,7 +1061,7 @@ bool MakeIdle(SparseRange& range, std::size_t slot, std::uint32_t now) noexcept 
     idled.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
-// Idle -> Clean (the swap file has its bytes: read-only) or Own (a fault handler; the slot is locked).
+// Idle -> Clean (the swap store has its bytes: read-only) or Own (a fault handler; the slot is locked).
 std::uint8_t WakeIdle(SparseRange& range, std::size_t slot) noexcept {
     const bool clean = InSwap(slot);
     if (mprotect(reinterpret_cast<void*>(SlotAddress(range, slot)), SparseSlot, clean ? PROT_READ : PROT_READ | PROT_WRITE) != 0)
@@ -891,7 +1070,8 @@ std::uint8_t WakeIdle(SparseRange& range, std::size_t slot) noexcept {
     idle_woken.fetch_add(1, std::memory_order_relaxed);
     return clean ? SlotClean : SlotOwn;
 }
-// Clean or Idle -> Own for a write: read-write, and the swap file's copy (now stale) is forgotten.
+// Clean or Idle -> Own for a write: read-write, and where the swap store has its bytes (as they
+// were) is forgotten. The store keeps them: units the write leaves alone are found there again.
 bool MakeDirty(SparseRange& range, std::size_t slot) noexcept {
     DropSlotAliases(range, slot); // read-only aliases of a Clean slot
     if (mprotect(reinterpret_cast<void*>(SlotAddress(range, slot)), SparseSlot, PROT_READ | PROT_WRITE) != 0) std::abort();
@@ -900,8 +1080,7 @@ bool MakeDirty(SparseRange& range, std::size_t slot) noexcept {
         swap_dirtied.fetch_add(1, std::memory_order_relaxed);
         NoteRewritten(slot);
         if (rewrite_noted != nullptr) rewrite_noted[slot].store(1, std::memory_order_relaxed);
-        if (swap_age_class != nullptr) {
-            const std::uint8_t was = swap_age_class[slot];
+        if (const std::uint8_t was = swap_age_class != nullptr ? swap_age_class[slot] : 0x40; !(was & 0x40)) {
             swap_age_dropped[(was & 7) % 6].fetch_add(1, std::memory_order_relaxed);
             swap_kind_dropped[(was >> 4) & 3].fetch_add(1, std::memory_order_relaxed);
         }
@@ -1119,7 +1298,7 @@ void ReturnSlot(SparseRange& range, std::size_t slot) noexcept {
         range.physical[slot] = -1;
         return;
     }
-    // Idle or Clean: a block of its own, as an Own slot's (below), and maybe a copy in the swap file.
+    // Idle or Clean: a block of its own, as an Own slot's (below), and maybe a copy in the swap store.
     if (state == SlotIdle || state == SlotClean) ForgetPacked(slot);
     if (state == SlotFine) {
         const std::size_t kept = FineKept(range, slot);
@@ -1156,7 +1335,7 @@ void ReturnSlot(SparseRange& range, std::size_t slot) noexcept {
 }
 
 // Packed -> Own: a block of its own, read-write, with the slot's data unpacked into it. From the swap
-// file -> Clean instead (read-only, the file keeps its copy), unless the block is wanted for writing.
+// store -> Clean instead (read-only, the store keeps its copy), unless the block is wanted for writing.
 // *to: the slot's state afterwards.
 bool UnpackSlot(SparseRange& range, std::size_t slot, std::uint8_t* to, bool for_write = false) noexcept {
 #ifdef PS5_NATIVE
@@ -1176,8 +1355,8 @@ bool UnpackSlot(SparseRange& range, std::size_t slot, std::uint8_t* to, bool for
         return false;
     }
     if (from_swap) {
-        if (!SwapReadSlot(view, table[slot])) {
-            Note("EDEN_SWAP a slot's data did not come back from the swap file as it was written\n");
+        if (swap_units == nullptr || !SwapReadSlot(view, swap_units + slot * SwapUnits, table[slot].hash)) {
+            Note("EDEN_SWAP a slot's data did not come back from the swap store as it was written\n");
             std::abort(); // the guest's data is gone: never carry on
         }
     } else {
@@ -1213,7 +1392,7 @@ bool UnpackSlot(SparseRange& range, std::size_t slot, std::uint8_t* to, bool for
         return false;
     }
     range.physical[slot] = physical;
-    if (!clean) ForgetPacked(slot); // a Clean slot's entry stays: the file keeps the copy
+    if (!clean) ForgetPacked(slot); // a Clean slot's entry stays: the store keeps the copy
     NoteTouched(slot);
     guest_committed.fetch_add(SparseSlot, std::memory_order_relaxed);
     unpacks.fetch_add(1, std::memory_order_relaxed);
@@ -1343,7 +1522,7 @@ bool MakeFine(SparseRange& range, std::size_t slot, const bool (&zero)[FinePages
 bool ServiceCommit(SparseRange& range, std::size_t slot) noexcept {
     LockSlot(range, slot);
     const std::uint8_t state = SlotState(range, slot);
-    // The block is wanted for writing: an Idle or Clean slot is Own again, without its copy in the swap file.
+    // The block is wanted for writing: an Idle or Clean slot is Own again, without its copy in the swap store.
     std::uint8_t to = SlotOwn;
     const bool ok = state == SlotZero ? PromoteZero(range, slot)
                   : state == SlotFine ? PromoteFine(range, slot)
@@ -1446,7 +1625,7 @@ bool WaitForBlock(Promote&& promote) noexcept {
     memory_waiters.fetch_add(1, std::memory_order_acq_rel);
     bool ok = false;
     for (unsigned tries = 0; tries < 100 && !ok; ++tries) {
-        // Slots nothing touches give their blocks up first (packed, or to the swap file): without
+        // Slots nothing touches give their blocks up first (packed, or to the swap store): without
         // waiting for a pass that is packing, and without the driver (this is a fault handler).
         if (RecoverMemory(2 * SparseSlot, false, false, 0) == 0) {
             const timespec pause{0, 20'000'000};
@@ -1593,7 +1772,7 @@ bool HandleGuestWriteFault(void* fault, int write) noexcept {
         } else if (state == SlotClean) {
             // Only a write faults on a Clean slot. A read that got here faulted while the slot was
             // Idle, and another thread woke it first: it can be read as it is, and keeps its copy
-            // in the swap file (dropped for a read, the slot would also count as written again).
+            // in the swap store (dropped for a read, the slot would also count as written again).
             // Should the fault's write bit ever be wrong, the access faults here again at once,
             // and is then taken for the write it is.
             if (write == 0 && repeats > 1) clean_refaults.fetch_add(1, std::memory_order_relaxed);
@@ -1939,15 +2118,21 @@ std::vector<std::uint64_t> cold_hash;
 std::vector<std::uint32_t> cold_since; // per Own slot: when its hash last changed (s, steady clock)
 
 // Slots that did not compress when last looked at, until they are written again (ColdPass sees their
-// sampled hash change): LZ4 is not tried on them again where they could not go to the swap file anyway.
+// sampled hash change): LZ4 is not tried on them again.
 std::uint8_t* pack_raw = nullptr;
+// Slots the swap store did not hold all of when they were last to go there without a write, until
+// they are written again: not hashed and looked up again for nothing.
+std::uint8_t* swap_absent = nullptr;
 // A recovery is packing (pack_mutex held): a packed slot's block goes straight back to the pool, not
 // to the blocks kept for unpacking, and pack_released tells whether it did (the store may have taken
 // it instead). The driver asked 32 MiB back, was told 32 MiB, and found none: the blocks had gone to
 // refill what unpacks had used, and its allocation ended the session.
 bool recovering = false, pack_released = false;
-std::atomic<std::uint64_t> swap_last_resort{0}; // slots written to the file as a request's last resort (RecoverMemory)
-enum class Swap { No, Reuse, Yes, Urgent }; // may the slot go to the swap file: never; only if the file has its bytes already; ...
+std::atomic<std::uint64_t> swap_last_resort{0}; // slots that went to the swap store as a request's last resort (RecoverMemory)
+// May the slot go to the swap store: never; only if that writes nothing (the store holds all of it);
+// with writes, inside the budget's part that is not kept for failed allocations; with writes down
+// to the budget's last byte.
+enum class Swap { No, Reuse, Yes, Urgent };
 
 // Idle -> Packed (Own, without Idle slots): the scanner, or a recovery (pack_mutex held). Readable
 // and not writable while it is compressed, then the zero block with no access.
@@ -1987,7 +2172,7 @@ bool PackSlot(SparseRange& range, std::size_t slot, Swap swap = Swap::No) noexce
         if (skipped) pack_skips.fetch_add(1, std::memory_order_relaxed);
         return false;
     };
-    const bool in_swap = table[slot].swap != 0; // Idle from Clean: the file has its bytes
+    const bool in_swap = table[slot].swap != 0; // Idle from Clean: the swap store has its bytes, and where is known
     if (in_swap && swap == Swap::No) {
         UnlockSlot(range, slot, before);
         return false;
@@ -1995,45 +2180,43 @@ bool PackSlot(SparseRange& range, std::size_t slot, Swap swap = Swap::No) noexce
     int size = 0;
     void* data = nullptr;
     bool to_swap = in_swap;
-    std::size_t unit = SwapMaxUnits, stored = 0;
     std::uint64_t hash = 0;
+    std::uint32_t units[SwapUnits];
     if (!in_swap) {
-        // Known not to compress: nothing to do unless it may go to the swap file and the budget has
-        // room for the least it could take (asked before LZ4 runs once more, 1 ms a slot).
-        if (pack_raw != nullptr && pack_raw[slot] != 0 &&
-            ((swap != Swap::Yes && swap != Swap::Urgent) || !SwapOn() || !SwapBudget(SparseSlot / 2, swap == Swap::Urgent))) {
-            UnlockSlot(range, slot, before);
-            pack_skips.fetch_add(1, std::memory_order_relaxed);
-            return false;
+        const bool may_swap = swap != Swap::No && SwapOn() && swap_units != nullptr;
+        // Known not to compress: nothing to do unless it may go to the swap store; and one that is to
+        // go without a write is not looked up again while it is as it was when the store had not all
+        // of it (swap_absent).
+        bool compresses = false;
+        if (pack_raw != nullptr && pack_raw[slot] != 0) {
+            if (!may_swap || (swap == Swap::Reuse && swap_absent != nullptr && swap_absent[slot] != 0)) {
+                UnlockSlot(range, slot, before);
+                pack_skips.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
         }
-        // Readable, not writable, while it is compressed (and written to the file).
+        // Readable, not writable, while it is compressed (or looked up in the swap store and written there).
         if (before == SlotOwn) Fence(at);
         else if (mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_READ) != 0) std::abort();
-        size = LZ4_compress_default(reinterpret_cast<const char*>(at), pack_scratch.data(),
-                                    static_cast<int>(SparseSlot), static_cast<int>(pack_scratch.size()));
-        const bool compresses = size > 0 && size <= static_cast<int>(SparseSlot * PackMaxRatio);
-        if (pack_raw != nullptr) pack_raw[slot] = compresses ? 0 : 1;
+        if (pack_raw == nullptr || pack_raw[slot] == 0) {
+            size = LZ4_compress_default(reinterpret_cast<const char*>(at), pack_scratch.data(),
+                                        static_cast<int>(SparseSlot), static_cast<int>(pack_scratch.size()));
+            compresses = size > 0 && size <= static_cast<int>(SparseSlot * PackMaxRatio);
+            if (pack_raw != nullptr) pack_raw[slot] = compresses ? 0 : 1;
+        }
         if (!compresses) {
-            // Not for the packed store. To the swap file when it may, while the slot can still be read.
-            if ((swap != Swap::Yes && swap != Swap::Urgent) || !SwapOn()) return leave(true);
-            const bool packed = size > 0 && static_cast<std::size_t>(size) <= SwapPackMax;
-            stored = packed ? static_cast<std::size_t>(size) : SparseSlot;
-            if (!SwapBudget(stored, swap == Swap::Urgent)) return leave(true);
-            unit = SwapAlloc(SwapUnitsOf(stored));
-            if (unit == SwapMaxUnits) {
-                swap_full.fetch_add(1, std::memory_order_relaxed);
+            // Not for the packed store. To the swap store when it may, while the slot can still be read.
+            if (!may_swap) return leave(true);
+            const std::uint64_t written = swap_written.load(std::memory_order_relaxed);
+            const SwapWrites writes =
+                swap == Swap::Reuse ? SwapWrites::None : swap == Swap::Urgent ? SwapWrites::Urgent : SwapWrites::Budget;
+            if (!SwapOutSlot(at, units, writes)) {
+                if (swap == Swap::Reuse && swap_absent != nullptr) swap_absent[slot] = 1;
                 return leave(true);
             }
             hash = FullHash(at, SparseSlot);
-            if (!SwapWrite(packed ? static_cast<const void*>(pack_scratch.data()) : reinterpret_cast<const void*>(at), stored,
-                           std::uint64_t{unit} * SwapUnit)) {
-                // The storage is full or failing: nothing more is written. The slot stays as it was.
-                SwapFree(unit, SwapUnitsOf(stored));
-                SwapOff("a write failed");
-                return leave(true);
-            }
-            if (!packed) swap_raw.fetch_add(1, std::memory_order_relaxed);
-            if (slot < cold_since.size()) NoteSwapWrite(slot, ColdNow() - cold_since[slot]);
+            if (slot < cold_since.size())
+                NoteSwapWrite(slot, ColdNow() - cold_since[slot], swap_written.load(std::memory_order_relaxed) != written);
             to_swap = true;
         } else if (!StoreStart()) {
             return leave(true);
@@ -2046,7 +2229,7 @@ bool PackSlot(SparseRange& range, std::size_t slot, Swap swap = Swap::No) noexce
     if (mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_NONE) != 0) std::abort();
     if (!MapSlot(at, PROT_NONE, zero_block)) {
         // The system will not map with no access: the slot stays as it was, and packing stops.
-        if (unit != SwapMaxUnits) SwapFree(unit, SwapUnitsOf(stored));
+        // (What went to the swap store for it stays there: found again by its contents.)
         pack_refused.store(true, std::memory_order_relaxed);
         Note("EDEN_CRAM_PACK off: the system refused a no-access mapping\n");
         return leave(false);
@@ -2074,9 +2257,10 @@ bool PackSlot(SparseRange& range, std::size_t slot, Swap swap = Swap::No) noexce
     range.physical[slot] = -1;
     guest_committed.fetch_sub(SparseSlot, std::memory_order_relaxed);
     if (in_swap) {
-        swap_reused.fetch_add(1, std::memory_order_relaxed); // its entry stays: nothing was written
+        swap_reused.fetch_add(1, std::memory_order_relaxed); // its entry stays: nothing was looked up or written
     } else if (to_swap) {
-        table[slot] = {nullptr, static_cast<std::uint32_t>(stored), static_cast<std::uint32_t>(unit + 1), hash};
+        std::memcpy(swap_units + slot * SwapUnits, units, sizeof(units));
+        table[slot] = {nullptr, 0, 1, hash};
         swap_slots.fetch_add(1, std::memory_order_relaxed);
     } else {
         table[slot] = {data, static_cast<std::uint32_t>(size), 0, 0};
@@ -2271,7 +2455,7 @@ void ColdPass(SparseRange& range, std::size_t slots) noexcept {
         std::uint32_t age = 0;
         if (state == SlotOwn) {
             const std::uint64_t hash = ColdHash(SlotAddress(range, slot));
-            // (A write that dropped the slot's copy in the swap file was counted there.)
+            // (A write that dropped the slot's copy in the swap store was counted there.)
             const bool noted = rewrite_noted != nullptr && rewrite_noted[slot].exchange(0, std::memory_order_relaxed) != 0;
             if (hash != cold_hash[slot]) {
                 // Written again after a while unwritten: memory the game reuses (swap_rewritten).
@@ -2279,6 +2463,7 @@ void ColdPass(SparseRange& range, std::size_t slots) noexcept {
                 cold_since[slot] = now;
                 cold_hash[slot] = hash;
                 if (pack_raw != nullptr) pack_raw[slot] = 0; // written: it may compress now
+                if (swap_absent != nullptr) swap_absent[slot] = 0;
             }
             age = now - cold_since[slot];
             c1 += age >= 20;
@@ -2351,7 +2536,7 @@ void StoreCompact(SparseRange& range, std::size_t slots) noexcept {
     for (std::size_t slot = 0; slot < slots && moved < (std::size_t{128} << 20); ++slot) {
         if (SlotState(range, slot) != SlotPacked) continue;
         void* const data = table[slot].data; // (looked at again under the slot's lock)
-        if (data == nullptr) continue;        // in the swap file
+        if (data == nullptr) continue;        // in the swap store
         const std::size_t block = (reinterpret_cast<std::uintptr_t>(data) - store_base) / StoreBlock;
         if (block == store_current || store_live[block].load(std::memory_order_relaxed) * 2 > StoreBlock) continue;
         if (!TryLockSlot(range, slot)) continue; // (a fault handler has it: TryLockSlot)
@@ -2414,6 +2599,8 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
             }
         }
         if (pack_raw == nullptr) pack_raw = new (std::nothrow) std::uint8_t[slots]();
+        if (swap_absent == nullptr) swap_absent = new (std::nothrow) std::uint8_t[slots]();
+        if (swap_units == nullptr) swap_units = new (std::nothrow) std::uint32_t[slots * SwapUnits]();
         if (swap_rewritten == nullptr) swap_rewritten = new (std::nothrow) std::atomic<std::uint8_t>[slots]();
         if (rewrite_noted == nullptr) rewrite_noted = new (std::nothrow) std::atomic<std::uint8_t>[slots]();
         if (swap_age_class == nullptr) swap_age_class = new (std::nothrow) std::uint8_t[slots]();
@@ -2425,8 +2612,8 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
     if (pack_refused.load(std::memory_order_relaxed) || !PoolShortForPacking()) return;
     // Device memory nothing is bound to goes back before any guest memory is packed.
     if (&eden_radv_private_radv_ps5_eden_trim != nullptr) (void)eden_radv_private_radv_ps5_eden_trim(std::uint64_t{512} << 20);
-    // The pool is short: the swap file is made ready (nothing is written to it but its test).
-    if (IdleEnabled() && idle_since != nullptr) (void)SwapStart();
+    // The pool is short: the swap store is opened (and what its storage has free looked at again).
+    if (IdleEnabled() && idle_since != nullptr && SwapStart()) SwapRoom();
     // The longest idle first; without Idle slots the coldest, each needing ColdSeconds << (times packed) unwritten.
     const bool idle_mode = IdleEnabled() && idle_since != nullptr;
     const std::uint32_t now = ColdNow();
@@ -2436,25 +2623,41 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
         if (idle_mode || now - cold_since[slot] >= (ColdSeconds << std::min<unsigned>(pack_times[slot], 4))) ready.push_back(slot);
     if (idle_mode) std::sort(ready.begin(), ready.end(), [](std::size_t a, std::size_t b) { return idle_since[a] < idle_since[b]; });
     else std::sort(ready.begin(), ready.end(), [](std::size_t a, std::size_t b) { return cold_since[a] < cold_since[b]; });
-    // Into the packed store only (slots that compress): the swap file takes slots only when memory
-    // is asked back (RecoverMemory).
+    // Into the packed store. What will not pack is left to the requests for memory (RecoverMemory),
+    // which send it to the swap store when an allocation has failed.
+    //
+    // PS5_Lichii's pass sends it there itself, before any allocation fails (EDEN_SWAP_PASS=2 does
+    // that here: slots never written again after a while unwritten with writes, inside the budget's
+    // part that is not kept for failed allocations, the others only where the store has their bytes).
+    // Its units are 64 KiB and what a touch brings back is one of them. Here a touch brings back 2 MiB,
+    // and Mario Kart World writes most of its memory again within minutes: of 824 slots the pass
+    // wrote in a 22-minute session the game had written 711 again, the budget was spent on them
+    // (1.9 GiB), and the load that then needed memory got none and ended the session; so did the
+    // next session, after 29 minutes. Ocarina of Time's memory stays as it is: of the 501 MiB one
+    // session wrote there, the next found 480 again.
+    // EDEN_SWAP_PASS=1: the pass sends only what costs no write, slots whose bytes the store holds.
+    static const std::size_t pass_swaps = EnvOr("EDEN_SWAP_PASS", 0);
     std::size_t done = 0;
+    bool dry = false; // the budget or the store's room said no in this pass
     for (const std::size_t slot : ready) {
         if (done >= PackPerPass) break;
         if (pack_times[slot] < 255) ++pack_times[slot];
-        if (PackSlot(range, slot, Swap::No)) {
+        swap_refused = false;
+        const Swap swap = pass_swaps == 0 ? Swap::No : pass_swaps >= 2 && Rewritten(slot) == 0 && !dry ? Swap::Yes : Swap::Reuse;
+        if (PackSlot(range, slot, swap)) {
             ++done;
             cold_since[slot] = now;
         }
+        dry = dry || swap_refused;
     }
     static const bool pass_log = EnvOr("EDEN_SWAP_LOG", 0) != 0;
     if (pass_log) {
         char line[240];
         const int length = std::snprintf(line, sizeof(line),
-            "EDEN_SWAP_PASS free=%zuMiB packed=%zu file=%lluMiB written=%lluMiB tokens=%lluMiB\n",
-            PoolFreePieces() >> 20, done,
-            (unsigned long long)(swap_used_units.load(std::memory_order_relaxed) * SwapUnit >> 20),
-            (unsigned long long)(swap_written.load(std::memory_order_relaxed) >> 20), (unsigned long long)(swap_tokens >> 20));
+            "EDEN_SWAP_PASS free=%zuMiB packed=%zu store=%lluMiB written=%lluMiB found=%lluMiB tokens=%lldMiB\n",
+            PoolFreePieces() >> 20, done, (unsigned long long)(std::uint64_t{swap_count} * SwapUnit >> 20),
+            (unsigned long long)(swap_written.load(std::memory_order_relaxed) >> 20),
+            (unsigned long long)(swap_found.load(std::memory_order_relaxed) * SwapUnit >> 20), (long long)(swap_tokens >> 20));
         if (length > 0) Report(line);
     }
 }
@@ -2589,30 +2792,31 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             (unsigned long long)pack_gpu_marked.load(std::memory_order_relaxed));
         if (pack_length > 0) Report(pack_line);
         ReportUnpackers();
-        // The swap file and the Idle slots. written: this session, to the storage (what wears it).
-        const std::uint64_t reads = swap_reads.load(std::memory_order_relaxed), writes = swap_writes.load(std::memory_order_relaxed);
+        // The swap store and the Idle slots. written: what this session added to the store (what
+        // wears the storage); found: what went there without a write, its bytes being there already.
+        const std::uint64_t reads = swap_reads.load(std::memory_order_relaxed);
         const std::uint64_t written = swap_written.load(std::memory_order_relaxed);
+        const std::uint64_t writes = written / SwapUnit;
         char swap_line[640];
         const int swap_length = std::snprintf(swap_line, sizeof(swap_line),
-            "EDEN_SWAP %s on=%d (%s) out=%zuMiB clean=%zuMiB file_used=%lluMiB written=%lluMiB written_today=%lluMiB "
-            "written_ever=%lluMiB writes=%llu raw=%llu write_ms=%llu reused=%llu dirtied=%llu reads=%llu read_avg_us=%llu "
-            "read_max_us=%llu denied_rate=%llu denied_cap=%llu full=%llu idle_now=%zuMiB idled=%llu woken=%llu kept_free=%lluMiB/%llu "
-            "last_resort=%llu late_reads=%llu/%llu\n", when,
-            swap_state.load(std::memory_order_relaxed) == 1 ? 1 : 0,
+            "EDEN_SWAP %s on=%d (%s) store=%lluMiB out=%zuMiB clean=%zuMiB written=%lluMiB found=%lluMiB zeroes=%lluMiB "
+            "write_ms=%llu writes=%llu reused=%llu dirtied=%llu reads=%llu read_avg_us=%llu read_max_us=%llu denied_rate=%llu full=%llu "
+            "absent=%llu idle_now=%zuMiB idled=%llu woken=%llu kept_free=%lluMiB/%llu last_resort=%llu late_reads=%llu/%llu\n",
+            when, swap_state.load(std::memory_order_relaxed) == 1 ? 1 : 0,
             swap_state.load(std::memory_order_relaxed) == 1 ? "ok" : swap_off_why.load(std::memory_order_acquire),
-            swapped_out * (SparseSlot >> 20), clean * (SparseSlot >> 20),
-            (unsigned long long)(swap_used_units.load(std::memory_order_relaxed) * SwapUnit >> 20),
-            (unsigned long long)(written >> 20), (unsigned long long)(SwapDayBytes(written) >> 20),
-            (unsigned long long)((swap_total_before + written) >> 20), (unsigned long long)writes,
-            (unsigned long long)swap_raw.load(std::memory_order_relaxed),
+            (unsigned long long)(std::uint64_t{swap_count} * SwapUnit >> 20), swapped_out * (SparseSlot >> 20),
+            clean * (SparseSlot >> 20), (unsigned long long)(written >> 20),
+            (unsigned long long)(swap_found.load(std::memory_order_relaxed) * SwapUnit >> 20),
+            (unsigned long long)(swap_zero_units.load(std::memory_order_relaxed) * SwapUnit >> 20),
             (unsigned long long)(swap_write_ns.load(std::memory_order_relaxed) / 1000000),
+            (unsigned long long)swap_appends.load(std::memory_order_relaxed),
             (unsigned long long)swap_reused.load(std::memory_order_relaxed),
             (unsigned long long)swap_dirtied.load(std::memory_order_relaxed), (unsigned long long)reads,
             (unsigned long long)(reads ? swap_read_ns.load(std::memory_order_relaxed) / reads / 1000 : 0),
             (unsigned long long)(swap_read_max_ns.load(std::memory_order_relaxed) / 1000),
             (unsigned long long)swap_denied_rate.load(std::memory_order_relaxed),
-            (unsigned long long)swap_denied_cap.load(std::memory_order_relaxed),
-            (unsigned long long)swap_full.load(std::memory_order_relaxed), idle * (SparseSlot >> 20),
+            (unsigned long long)swap_full.load(std::memory_order_relaxed),
+            (unsigned long long)swap_missed.load(std::memory_order_relaxed), idle * (SparseSlot >> 20),
             (unsigned long long)idled.load(std::memory_order_relaxed), (unsigned long long)idle_woken.load(std::memory_order_relaxed),
             (unsigned long long)(keeper_bytes.load(std::memory_order_relaxed) >> 20),
             (unsigned long long)keeper_calls.load(std::memory_order_relaxed),
@@ -2866,11 +3070,13 @@ void ServiceStop(SparseRange& range) noexcept {
 #endif
     ServiceReport(range, "end");
     MeasureFinePages(range);
-    {
-        const std::lock_guard pack_lock{pack_mutex};
-        SwapLedgerFlush();
-    }
     service_range.store(nullptr, std::memory_order_release);
+    // A request for memory that is at the range's slots now (the driver's or the heap's, on a thread
+    // of its own) holds pack_mutex: it is waited for here, and those that come later find no range
+    // (RecoverMemory). The tables it reads go after this (ReleaseServiceBlocks).
+    if (!holding_pack) {
+        const std::lock_guard pack_lock{pack_mutex};
+    }
     // Packed data goes with the range (ReleaseServiceBlocks drops what is still packed after this).
 #ifdef PS5_NATIVE
     EmptyReserve();
@@ -2907,14 +3113,11 @@ void ReleaseServiceBlocks(SparseRange& range) noexcept {
         cold_hash.clear();
         cold_since.clear();
         pack_times.clear();
-        // The swap file is empty again and takes no storage; it stays open, with what was written
-        // counted on, for the next game of this session. (Every slot's units went back above; the
-        // map is cleared whole all the same: a unit left taken would be lost to every later game.)
-        for (auto& word : swap_map) word.store(0, std::memory_order_relaxed);
-        swap_used_units.store(0, std::memory_order_relaxed);
+        // (The swap store stays as it is, open: its slots are found by their contents, by the next
+        // game of this session and by later sessions.)
         swap_slots.store(0, std::memory_order_relaxed);
-        swap_hint = 0;
-        if (swap_fd >= 0) (void)ftruncate(swap_fd, 0);
+        delete[] std::exchange(swap_units, nullptr);
+        delete[] std::exchange(swap_absent, nullptr);
         delete[] std::exchange(idle_since, nullptr);
         delete[] std::exchange(touch_since, nullptr);
         delete[] std::exchange(touch_times, nullptr);
@@ -2984,7 +3187,7 @@ constexpr std::uint32_t KeeperColdSeconds = 60; // see RecoverMemory
 // `driver`: the driver may be asked to trim (not from a fault handler: the thread may be in the driver).
 // `keeper`: the keeper's own call (KeepFree): no memory was refused yet; it never waits for the lock,
 // takes nothing from the blocks kept for the guest, and prints nothing. 1: it only packs; 2: it may
-// write to the swap file too.
+// write to the swap store too.
 std::size_t RecoverMemory(std::size_t bytes, bool wait, bool driver = true, int keeper = 0) noexcept {
 #ifdef PS5_NATIVE
     SparseRange* const range = service_range.load(std::memory_order_acquire);
@@ -3004,7 +3207,7 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait, bool driver = true, int 
         pack_lock.lock();
     } else {
         // The heap and the fault handlers: never a wait without end (whoever packs may be waiting for
-        // the heap's lock), but up to half a second: a pass writing to the swap file holds the lock
+        // the heap's lock), but up to half a second: a pass writing to the swap store holds the lock
         // that long, and the heap's growth that found it taken got nothing back and failed
         // (std::bad_alloc ended a Mario Kart World session with 1.3 GB of the budget unused).
         for (unsigned tries = 0; !pack_lock.try_lock(); ++tries) {
@@ -3015,13 +3218,16 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait, bool driver = true, int 
     }
     holding_pack = true;
     struct Held { ~Held() { holding_pack = false; } } held;
+    // (A game's end clears service_range and then takes this lock once, before the range's tables
+    // go: ServiceStop. A request that was on its way here finds that out now.)
+    if (service_range.load(std::memory_order_acquire) != range) return trimmed;
     if (packed_slots.load(std::memory_order_acquire) == nullptr || cold_since.empty() ||
         recover_order.capacity() < cold_since.size() || cold_since.size() >> RecoverSlotBits != 0)
         return trimmed + (keeper ? 0 : GiveBackIdleBlocks(bytes, !driver));
     // What is asked for is all the taker needs, and the pool may have part of it: the driver asks
     // for the whole 560 MiB of one image and 16 more (a texture array of Mario Kart World's, at a
     // track's load), again at each of its tries, and 574 MiB of the guest's memory gave their
-    // blocks up each time, up to 250 MiB of them by way of the swap file, whatever the pool had
+    // blocks up each time, up to 250 MiB of them by way of the swap store, whatever the pool had
     // free. Only what the pool lacks is taken now (and no less than LargeRequest, for the takers
     // that come in between).
     const std::size_t pool_free = driver && !keeper ? PoolFreePieces() : 0;
@@ -3044,7 +3250,7 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait, bool driver = true, int 
         for (std::size_t slot = 0; slot < cold_since.size(); ++slot)
             if (SlotState(*range, slot) == SlotIdle && now - idle_since[slot] >= idle_for)
                 recover_order.push_back(slot);
-        // Slots the swap file already has first (giving their blocks up writes nothing). Then those
+        // Slots the swap store already has first (giving their blocks up writes nothing). Then those
         // that were never written again after a while unwritten, before memory the game reuses
         // (swap_rewritten), and of each kind the longest unwritten first. The order is fixed here,
         // from what the slots are now (fault handlers change them while this runs): each entry
@@ -3072,17 +3278,17 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait, bool driver = true, int 
             if (SlotState(*range, slot) == SlotOwn && now - cold_since[slot] >= 10) recover_order.push_back(slot);
         std::sort(recover_order.begin(), recover_order.end(), [](std::size_t a, std::size_t b) { return cold_since[a] < cold_since[b]; });
     }
-    // A load can take the pool from comfortable to empty between two scanner passes: the swap file
+    // A load can take the pool from comfortable to empty between two scanner passes: the swap store
     // is made ready here then (the driver's call: a thread that may allocate and print).
     if (driver && (wait || keeper) && idle_mode) (void)SwapStart();
     // Four steps, each only if the ones before did not give enough:
-    //   0. What costs no write: slots that compress go to the packed store, slots the swap file
-    //      already has give their blocks up.
-    //   1. Slots that were never written again after a while unwritten (swap_rewritten) are written
-    //      to the file, the longest unwritten first.
+    //   0. What costs no write: slots that compress go to the packed store, and slots whose bytes
+    //      the swap store holds (all of them: found by their contents) give their blocks up.
+    //   1. Slots that were never written again after a while unwritten (swap_rewritten) go to the
+    //      swap store with what it lacks of them written, the longest unwritten first.
     //   2. The blocks the service keeps idle go back (GiveBackIdleBlocks).
-    //   3. For a request that would otherwise get nothing, the slots the game reuses are written
-    //      too: the budget is what limits the writes, and inside it an allocation that fails ends
+    //   3. For a request that would otherwise get nothing, the slots the game reuses go the same
+    //      way: the budget is what limits the writes, and inside it an allocation that fails ends
     //      the session.
     // The keeper (no allocation failed yet) stops after step 0, or after step 1 when it may write.
     std::size_t freed = 0, given = 0, to_file = 0, last_resort = 0;
@@ -3101,8 +3307,10 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait, bool driver = true, int 
         const Swap swap = step == 0 ? Swap::Reuse : keeper ? Swap::Yes : Swap::Urgent;
         PackedSlot* const entries = packed_slots.load(std::memory_order_acquire);
         recovering = true;
+        swap_refused = false;
         for (const std::size_t slot : recover_order) {
-            if (freed + given >= bytes) break;
+            // (Enough, or the budget or the store's room has said no: the slots left would be hashed for nothing.)
+            if (freed + given >= bytes || (step != 0 && swap_refused)) break;
             const bool in_file = entries[slot].swap != 0;
             if (step != 0 && !in_file) {
                 if ((Rewritten(slot) != 0) != (step == 3)) continue;
@@ -3156,7 +3364,7 @@ namespace {
 // nothing has touched for IdleSeconds give their blocks up until 256 MiB more than that is free.
 //
 // It does that with what costs no write: slots that compress go to the packed store, and slots
-// the swap file already has give their blocks up. It used to write slots to the file as well
+// the swap store already has give their blocks up. It used to write slots to the store as well
 // (once the pool had stayed under the mark for 3 s). That kept 512 MiB free at all times at the
 // storage's cost: in a 30-minute Mario Kart World session the keeper had most of 3 GiB written,
 // two thirds of it for slots the game wrote over within minutes, while requests after a failed
@@ -3186,7 +3394,7 @@ void KeepFree() noexcept {
         below_since = 0;
         return;
     }
-    // Packing in memory at once. To the swap file, when it may at all (EDEN_SWAP_KEEPER=1), only
+    // Packing in memory at once. To the swap store, when it may at all (EDEN_SWAP_KEEPER=1), only
     // when the pool has stayed under the mark for 3 s or has a quarter of it left: a race start
     // takes 2 GB and gives half of it back within seconds.
     static const bool may_write = EnvOr("EDEN_SWAP_KEEPER", 0) != 0;
@@ -3202,6 +3410,17 @@ void KeepFree() noexcept {
 extern "C" std::size_t eden_memory_recover(std::size_t bytes) noexcept { return RecoverMemory(bytes, true); }
 // Never waits: for the heap, which may hold its growth lock while the scanner allocates.
 extern "C" std::size_t eden_memory_recover_try(std::size_t bytes) noexcept { return RecoverMemory(bytes, false); }
+// The swap store as numbers, for the crash report (a signal handler: plain reads, no lock): MiB it
+// holds, MiB it may hold, MiB written this session, slots the budget refused, slots its size
+// refused. Returns 0 while it is not opened, 1 when it is on, 2 when it is off.
+extern "C" int eden_swap_numbers(unsigned long long numbers[5]) noexcept {
+    numbers[0] = std::uint64_t{swap_count} * SwapUnit >> 20;
+    numbers[1] = std::uint64_t{swap_limit} * SwapUnit >> 20;
+    numbers[2] = swap_written.load(std::memory_order_relaxed) >> 20;
+    numbers[3] = swap_denied_rate.load(std::memory_order_relaxed);
+    numbers[4] = swap_full.load(std::memory_order_relaxed);
+    return swap_state.load(std::memory_order_relaxed);
+}
 
 
 // ---- What the guest's kernel tells the service ----

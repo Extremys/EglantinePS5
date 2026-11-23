@@ -559,14 +559,12 @@ int main(int argc, char** argv) {
                                           std::pair{"EDEN_PS5_WORKER_SPIN_US", "300"}}) {
             setenv(name, value, 0);
         }
-        // The guest memory service's swap file (src/guest_memory_service.inc, "Swap"): in the data
-        // folder's cache, so only with storage access. It is made when a game first runs short of
-        // memory and unlinked at once (a file left under its name, should there be one, is removed).
+        // The guest memory service's swap store (src/guest_memory_service.inc, "Swap"): store.bin and
+        // index.bin in the data folder's cache/swap, kept between sessions, so only with storage
+        // access. They are opened when a game first runs short of memory.
         if (Eden::FilesystemAccess()) {
-            const std::string swap_file = std::string{Eden::kDataDir} + "/cache/guest-memory.swap";
             (void)mkdir((std::string{Eden::kDataDir} + "/cache").c_str(), 0777);
-            (void)std::remove(swap_file.c_str());
-            setenv("EDEN_SWAP_PATH", swap_file.c_str(), 0);
+            setenv("EDEN_SWAP_DIR", (std::string{Eden::kDataDir} + "/cache/swap").c_str(), 0);
             // "performance": { "swap_file": false } in the settings file switches it off.
             if (!Eden::LoadSwapFile()) setenv("EDEN_SWAP", "0", 0);
         }

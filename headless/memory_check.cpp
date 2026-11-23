@@ -1839,10 +1839,12 @@ static void CheckReadTrapAreas() {
     std::printf("Read trap areas PASS: %u cases\n", cases);
 }
 
-// The swap file's own parts (src/guest_memory_service.inc, "Swap"): a slot there and back as it is
-// and compressed, a changed byte caught by the hash, the budget's limits, and the ledger over
-// sessions that end in order, without warning, and after midnight. Its steps are numbered in
-// eden_swap_check.
+// The swap store's own parts (src/guest_memory_service.inc, "Swap"): a slot there and back, its
+// units found again without a write in the same session and in the next, units of zeroes and twins,
+// scattered new units in one write, a changed byte in the store, the budget and its refill, the
+// store's limit and the storage's, an index ahead of its store, and a store that starts over:
+// nearly full only, once a day at most, and never without its time on the storage. Its steps are
+// numbered in eden_swap_check.
 extern "C" int eden_swap_check(const char* folder) noexcept;
 extern "C" int LZ4_versionNumber(void); // (a reference that links LZ4 in: the port's own are weak)
 static void CheckSwapFile() {
@@ -1853,10 +1855,10 @@ static void CheckSwapFile() {
             static_cast<int>(sizeof(folder)));
     require(mkdtemp(folder) != nullptr);
     const int failed = eden_swap_check(folder);
-    if (failed != 0) std::fprintf(stderr, "Swap file: step %d failed\n", failed);
+    if (failed != 0) std::fprintf(stderr, "Swap store: step %d failed\n", failed);
     require(failed == 0);
-    require(rmdir(folder) == 0); // nothing is left behind: the file was unlinked while open
-    std::printf("Swap file PASS: 25 steps\n");
+    require(rmdir(folder) == 0); // (the check removes its store)
+    std::printf("Swap store PASS: 62 steps\n");
 }
 
 int main(int argc, char** argv) {
