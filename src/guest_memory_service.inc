@@ -194,6 +194,13 @@ std::int64_t* pack_kept = nullptr; // per slot: the block a packed slot kept, -1
 std::atomic<std::atomic<std::int32_t>*> gpu_cached_table{nullptr};
 std::size_t gpu_cached_slots = 0;
 std::atomic<std::uint64_t> pack_gpu_skips{0}, pack_gpu_marked{0};
+// The slot holds pages DeviceMemoryManager maps for the GPU: it never goes no-access, and it is not
+// split (MapSub leaves it unmapped for a moment). Checked again under the slot's lock by whatever
+// makes it so; eden_guest_gpu_cached takes the lock once before it reads the page.
+bool GpuCachedSlot(std::size_t slot) noexcept {
+    auto* table = gpu_cached_table.load(std::memory_order_acquire);
+    return table != nullptr && slot < gpu_cached_slots && table[slot].load(std::memory_order_acquire) > 0;
+}
 // Slots a GPU thread (the command reader "GPU", or "GPUBack") ever had to unpack: never packed again.
 // The caches' count misses what the command reader reads (command lists, draw arguments), and one
 // such unpack was enough for impossible draws.
@@ -1271,7 +1278,14 @@ extern "C" void eden_guest_gpu_cached(const void* host, int delta) noexcept {
     // A page mapped for the GPU while its unit is probed or packed would reach the GPU no-access:
     // read it once here, on the mapping thread, so the fault handler brings it back first. From
     // now on GpuKeepsSlot keeps the slot out of probing and packing.
-    if (delta > 0) (void)*static_cast<const volatile std::uint8_t*>(host);
+    if (delta > 0) {
+        // A probe, pack or split of this slot under way finishes first; any later one sees the count.
+        if (range->state != nullptr && slot < (range->end - begin) / SparseSlot) {
+            LockSlot(*range, slot);
+            UnlockSlot(*range, slot, SlotState(*range, slot));
+        }
+        (void)*static_cast<const volatile std::uint8_t*>(host);
+    }
 }
 
 extern "C" unsigned eden_guest_memory_wanted(void) noexcept {
@@ -1361,7 +1375,8 @@ bool HandleGuestWriteFault(void* fault) noexcept {
     }
     // Zero and Sub slots back the written 64 KiB unit only (SubEnabled); they stay (become) Sub.
     const std::size_t unit = (address - SlotAddress(*range, slot)) % SparseSlot / SubUnit;
-    const bool sub = range->sub != nullptr && (state == SlotSub || (state == SlotZero && SubEnabled()));
+    // (a Zero slot the GPU's mappings hold is promoted whole: MapSub would unmap it for a moment)
+    const bool sub = range->sub != nullptr && (state == SlotSub || (state == SlotZero && SubEnabled() && !GpuCachedSlot(slot)));
     // A write fault on a unit that is backed and writable has nothing to change (counted as a repeat).
     const bool unchanged = state == SlotSub && (range->sub[slot] & ~range->sub_probe[slot] & (1u << unit));
     const auto promote = [&]() noexcept {
@@ -1601,13 +1616,14 @@ bool ScanFine(SparseRange& range, std::size_t slot) noexcept {
 bool ScanSub(SparseRange& range, std::size_t slot, std::size_t min_zero = SubMinZeroUnits()) noexcept {
 #ifdef PS5_NATIVE
     const std::uintptr_t at = SlotAddress(range, slot);
-    if (range.sub == nullptr || (min_zero != 0 && counters.passes.load(std::memory_order_relaxed) < range.fine_after[slot]))
+    if (range.sub == nullptr || GpuCachedSlot(slot) ||
+        (min_zero != 0 && counters.passes.load(std::memory_order_relaxed) < range.fine_after[slot]))
         return false;
     std::size_t zeros = 0;
     for (std::size_t unit = 0; unit < SubUnits; ++unit) zeros += UnitZero(at + unit * SubUnit);
     if (zeros < min_zero) return false;
     LockSlot(range, slot);
-    if (SlotState(range, slot) != SlotOwn) {
+    if (SlotState(range, slot) != SlotOwn || GpuCachedSlot(slot)) {
         UnlockSlot(range, slot, SlotState(range, slot));
         return false;
     }
@@ -1828,7 +1844,7 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
         return false;
     }
     LockSlot(range, slot);
-    if (SlotState(range, slot) != SlotOwn) {
+    if (SlotState(range, slot) != SlotOwn || GpuCachedSlot(slot)) {
         UnlockSlot(range, slot, SlotState(range, slot));
         return false;
     }
@@ -2070,7 +2086,7 @@ bool PackUnit(SparseRange& range, std::size_t slot, std::size_t unit) noexcept {
 #ifdef PS5_NATIVE
     if (GpuKeepsSlot(slot)) return false;
     LockSlot(range, slot);
-    if (SlotState(range, slot) != SlotSub || !(range.sub[slot] & (1u << unit))) {
+    if (SlotState(range, slot) != SlotSub || !(range.sub[slot] & (1u << unit)) || GpuKeepsSlot(slot)) {
         UnlockSlot(range, slot, SlotState(range, slot));
         return false;
     }
@@ -2137,7 +2153,8 @@ void SplitColdSlots(SparseRange& range, const std::vector<std::size_t>& candidat
 bool ProbeUnit(SparseRange& range, std::size_t slot, std::size_t unit) noexcept {
     if (GpuKeepsSlot(slot)) return false;
     LockSlot(range, slot);
-    const bool ok = SlotState(range, slot) == SlotSub && (range.sub[slot] & ~range.sub_probe[slot] & (1u << unit));
+    const bool ok = SlotState(range, slot) == SlotSub && (range.sub[slot] & ~range.sub_probe[slot] & (1u << unit)) &&
+                    !GpuKeepsSlot(slot);
     if (ok) {
         if (mprotect(reinterpret_cast<void*>(SlotAddress(range, slot) + unit * SubUnit), SubUnit, PROT_NONE) != 0) std::abort();
         range.sub_probe[slot] |= 1u << unit;
@@ -2565,12 +2582,20 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         const std::uint64_t store_data = packed_bytes.load(std::memory_order_relaxed) + units_packed_bytes.load(std::memory_order_relaxed);
         const std::size_t reserve_mib = reserve_count.load(std::memory_order_relaxed) * (SparseSlot >> 20);
         const std::size_t keep_mib = unpack_keep_count.load(std::memory_order_relaxed) * (SparseSlot >> 20);
+        std::size_t gpu_slots = 0, gpu_held = 0;
+        for (std::size_t slot = 0; slot < slots; ++slot)
+            if (GpuCachedSlot(slot)) {
+                ++gpu_slots;
+                const auto state = SlotState(range, slot);
+                gpu_held += state == SlotOwn ? SparseSlot
+                          : state == SlotSub ? static_cast<std::size_t>(__builtin_popcount(range.sub[slot])) * SubUnit : 0;
+            }
         const int sub_length = std::snprintf(line, sizeof(line),
             "EDEN_CRAM_SUB %s slots=%zu units=%zuMiB store=%zuMiB pieces=%lluMiB made=%llu backed=%llu given=%llu "
             "whole=%llu from_own=%llu failures=%llu remaps=%llu own=%zuMiB unit_packed=%lluMiB unit_stored=%lluMiB "
             "unit_packs=%llu unit_unpacks=%llu unit_skips=%llu splits=%llu moves=%llu store_held=%zuMiB "
             "probes=%llu probe_hits=%llu came_back=%llu store_data=%lluMiB store_slack=%lldMiB store_moved=%lluMiB "
-            "reserve=%zuMiB unpack_keep=%zuMiB pager_total=%zuMiB\n",
+            "reserve=%zuMiB unpack_keep=%zuMiB pager_total=%zuMiB gpu_slots=%zu gpu_held=%zuMiB gpu_skips=%llu\n",
             when, sub, sub_units * SubUnit >> 20, unit_held.load(std::memory_order_relaxed) >> 20,
             (unsigned long long)(unit_live.load(std::memory_order_relaxed) * SubUnit >> 20),
             (unsigned long long)sub_made.load(), (unsigned long long)sub_backed.load(), (unsigned long long)sub_given.load(),
@@ -2582,7 +2607,8 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             (unsigned long long)unit_probes.load(), (unsigned long long)unit_probe_hits.load(), (unsigned long long)unit_came_back.load(),
             (unsigned long long)(store_data >> 20), (long long)(store_held.load(std::memory_order_relaxed) >> 20) - (long long)(store_data >> 20),
             (unsigned long long)(store_moved.load() >> 20), reserve_mib, keep_mib,
-            (guest_committed.load(std::memory_order_relaxed) >> 20) + (store_held.load(std::memory_order_relaxed) >> 20) + reserve_mib + keep_mib);
+            (guest_committed.load(std::memory_order_relaxed) >> 20) + (store_held.load(std::memory_order_relaxed) >> 20) + reserve_mib + keep_mib,
+            gpu_slots, gpu_held >> 20, (unsigned long long)pack_gpu_skips.load(std::memory_order_relaxed));
         if (sub_length > 0) Report(line);
     }
     // Who wrote the slots that were promoted: the largest places (offsets in the app's image).
