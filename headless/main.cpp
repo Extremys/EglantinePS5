@@ -1363,6 +1363,14 @@ int main(int argc, char** argv) {
             const auto cheats_on = Eden::LoadChosenCheats(title);
             Eden::Cheats::Off() = Eden::Mods::CheatsOff(all_mods, cheats_on);
             const std::string mods = Eden::Mods::Summary(all_mods, mods_off, cheats_on);
+            // Ocarina of Time's built-in patches now apply without a mod folder (patch_manager.cpp).
+            // Dynamic FPS / FPS Unlock keep the game at real speed under 30 FPS. Max Resolution
+            // (full-scale 3D instead of the game's dynamic resolution) and Texture Pool x2 cost
+            // GPU time and memory a 12 GiB pool does not have: off unless EDEN_OOT_MAX_RESOLUTION=1.
+            if (title == 0x0400486024DEC000ULL && !std::getenv("EDEN_OOT_MAX_RESOLUTION")) {
+                mods_off.emplace_back("Max Resolution (built-in)");
+                mods_off.emplace_back("Texture Pool x2 (built-in)");
+            }
             Settings::values.disabled_addons[title] = mods_off;
             Eden::Report("launch", ("Mods: " + mods).c_str());
             Eden::Crash::SetSession("game " + std::filesystem::path(guest).filename().string() + " (" + title_id +
