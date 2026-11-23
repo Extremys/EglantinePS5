@@ -1,7 +1,20 @@
 # More of PS5_Lichii's memory and speed work, on top of the swap store
 
-Status, 2026-11-23: a plan. Nothing below is implemented in this branch yet. It is stacked on
-`feature/safe-swap` (PR #135), which brought PS5_Lichii's swap store.
+Status, 2026-11-23: being implemented in this branch, stacked on `feature/safe-swap` (PR #135),
+which brought PS5_Lichii's swap store. **None of it has run on the console yet**: by decision the
+console runs come once, at the end (two of Mario Kart World, one of Donkey Kong Bananza, one of
+Ocarina of Time, against the numbers PR #135 has). Each step has a switch that restores what was
+there before, so that a result can be traced to its step afterwards.
+
+| Step | State | Switch back |
+|---|---|---|
+| 1a. The transcode's decode image, a few layers at a time | written (`TranscodeAstcToBcn`), syntax and arithmetic checked | `EDEN_PS5_TRANSCODE_LAYER_BATCH=0` |
+| 1b. BC7 texture store (emulator side and tool) | written, `docs/TEXTURE-STORE.md`; no store exists for any game yet, so it is idle until the tool has been run over one | `EDEN_NX2_TEXTURE_STORE=0` |
+| 2, 3. Slots nothing touches in 64 KiB units: zstd in memory, the swap store, one unit back at a touch | written, host-checked (`eden_swap_check` steps 64 to 67), compiles for the console | `EDEN_CRAM_UNITS=0` |
+| 4. JIT code caches backed as written | written, host-checked (`CheckCodeRanges`), `docs/JIT-CODE-CACHE-LAZY.md` | `EDEN_JIT_LAZY_CACHE=0` |
+| 5. What the pool has free, counted in 2 MiB pieces for the caches | written | `EDEN_POOL_FREE_PIECES=0` |
+| 6. The fastmem window by default | not done, see below | |
+| 7. Our own memcmp | ported, host-checked (`tools/check-memcmp.py`) | build-time only |
 
 Source: PS5_Lichii (mihawk, `codeberg.org/mihawk/PS5_Lichii`, commit `5a424f7`), its
 `docs/ps5/levers.md` and the topic files beside it. What Lichii reports there for the PS5 Pro is
@@ -58,3 +71,27 @@ hour) and Ocarina of Time, as PR #135 was. Steps 1 and 3 are the large ones.
 
 The launcher's "Update available" dialog takes the focus about 20 s after it opens. No test
 presses Cross in the launcher without a screenshot first.
+
+## What changed while implementing
+
+- **Steps 2 and 3 are one piece of work, and not a rewrite.** Memory in use stays in 2 MiB slots
+  (the driver takes the pool in 2 MiB pieces, and Lichii lists "2 MiB slab allocation" among what
+  its own design still lacks). It is the slot nothing touches that goes in 64 KiB units; a touch
+  brings back one unit, from a slab of the pool cut in 32. See "Units" in
+  `src/guest_memory_service.inc`.
+- **Step 5 turned out differently.** Our driver has Lichii's double count, but nothing here reads
+  that number (`docs/LICHII-SMALL-PORTS.md`). What the port did get wrong is the other half of
+  that lever: the caches were told the pool's largest free block, where the driver can take what
+  is free in 2 MiB pieces.
+- **Step 4's premise was wrong.** The code caches already took their memory as the JIT reached
+  it, in 16 MiB steps (192 MiB at boot for a Switch 2 title's six cores). The step is now one
+  2 MiB piece (120 MiB at boot), the executable views lie in one span of just under 2 GiB, and a
+  Switch 2 title's cores get Lichii's 320 MiB each (`docs/JIT-CODE-CACHE-LAZY.md`).
+- **Step 1b needs a store.** The emulator side looks textures up by the hash of their guest bytes
+  in `/data/eglantineps5/texture-store/<title id>/`; the files come from
+  `tools/texture-store`, run on a PC over the unpacked game. Until someone has done that for a
+  game, the step changes nothing for it.
+- **Step 6 is not done.** `docs/FASTMEM64-WINDOW.md` measured the window at the defaults' frame
+  rate on Mario Kart World, not above it, and the window shows whole 2 MiB blocks: with it on, a
+  touch has to bring a slot in units back whole, which is what step 3 is there to avoid. It
+  stays opt-in (`EDEN_FASTMEM64=1`).
