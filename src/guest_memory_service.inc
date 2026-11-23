@@ -4187,6 +4187,10 @@ namespace {
 // allocation, the only ones that show memory is needed, came 42 times. Free memory also draws
 // takers: the graphics caches keep more when the pool has more. EDEN_SWAP_KEEPER=1 lets it
 // write again (slots unwritten for KeeperColdSeconds and never written again after a while).
+// What the pool had free in 2 MiB pieces when the keeper last counted them (it does while the
+// largest free block is under its mark), for eden_pool_free_pieces.
+std::atomic<std::size_t> pool_free_seen{0};
+std::atomic<std::uint64_t> pool_free_seen_ns{0};
 std::size_t KeepFreeMark() noexcept {
     static const std::size_t bytes = EnvOr("EDEN_CRAM_KEEP_FREE_MIB", 512) << 20;
     return bytes;
@@ -4205,6 +4209,8 @@ void KeepFree() noexcept {
         sceKernelAvailableDirectMemorySize(0, total, SparseSlot, &start, &largest) != 0 || largest >= mark)
         return;
     const std::size_t free_pieces = PoolFreePieces();
+    pool_free_seen.store(free_pieces, std::memory_order_relaxed);
+    pool_free_seen_ns.store(SwapNow(), std::memory_order_release);
     static std::uint64_t below_since = 0; // the keeper's thread only
     if (free_pieces >= mark) {
         below_since = 0;
@@ -4226,6 +4232,21 @@ void KeepFree() noexcept {
 extern "C" std::size_t eden_memory_recover(std::size_t bytes) noexcept { return RecoverMemory(bytes, true); }
 // Never waits: for the heap, which may hold its growth lock while the scanner allocates.
 extern "C" std::size_t eden_memory_recover_try(std::size_t bytes) noexcept { return RecoverMemory(bytes, false); }
+// What the pool has free in 2 MiB pieces, as the keeper counted it within the last half second; 0
+// when it has not (the largest free block is then above the keeper's mark, and says enough).
+// headless/performance.cpp tells the graphics caches: the driver takes memory in such pieces
+// (tools/patch-radv-pieces.py), so the largest free block alone understates what it can have. After
+// PS5_Lichii's driver, whose budget and available memory "count the whole shared pool, in 2 MiB
+// pieces" (docs/ps5/levers.md there).
+extern "C" std::size_t eden_pool_free_pieces(void) noexcept {
+#ifdef PS5_NATIVE
+    const std::uint64_t seen = pool_free_seen_ns.load(std::memory_order_acquire);
+    if (seen == 0 || SwapNow() - seen > 500'000'000ull) return 0;
+    return pool_free_seen.load(std::memory_order_relaxed);
+#else
+    return 0;
+#endif
+}
 // The swap store as numbers, for the crash report (a signal handler: plain reads, no lock): MiB it
 // holds, MiB it may hold, MiB written this session, slots the budget refused, slots its size
 // refused. Returns 0 while it is not opened, 1 when it is on, 2 when it is off.
