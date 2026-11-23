@@ -278,6 +278,11 @@ sit Idle), no allocation is refused, and nothing is written but the test page. `
 same scene at 33.2 and 33.7 FPS the same night (2 runs; by the game's frames, which gives 33.6
 to 34.2 for the six runs above).
 
+With its pipeline cache removed (the game's own squeeze used to be the heap while pipelines
+compile at the scene's load) it is the same: 33.4 and 33.8 FPS on this branch, 33.1 on `main`,
+the pool's largest free block never under 0.8 GB, nothing written. In none of these runs did
+Ocarina of Time need the file.
+
 ### Donkey Kong Bananza
 
 One 3-minute run each: 30.5 FPS on this branch, 30.2 on `main`. The pool never gets short (its
