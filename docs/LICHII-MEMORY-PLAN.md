@@ -22,11 +22,18 @@ the largest.
 
 ## What it lacks, in the order proposed
 
-1. **A BC7 texture store** in place of ASTC decoded to RGBA: BC7 at a quarter of the memory,
-   kept by the hash of the guest's bytes. The largest single need of Mario Kart World is a
-   560 MiB RGBA8 array per track, and most of what the swap store writes late in a session is
-   written to make room for it. First: what the GPU transcode here does with that array, and
-   why it is still RGBA8.
+1. **The texture array's 560 MiB, and the BC7 texture store.** Looked at on 2026-11-23:
+   - The 560 MiB image is not what the game's texture ends as. It is the RGBA8 image the GPU
+     transcode decodes into (`TranscodeAstcToBcn`, `vk_texture_cache.cpp`): all 46 layers and 11
+     levels at once, alive until the GPU has encoded them to BC3 (140 MiB), with a 128 MiB
+     staging buffer for the result. Decoding and encoding a few layers at a time keeps that
+     under the 64 MiB the transcode already holds itself to for smaller images. That is the
+     first change of this step, and it needs nothing from outside.
+   - Lichii's BC7 store is made ahead of time, off the console: a tool (`ps5/tools/texture-store`)
+     reads the unpacked game, decodes each ASTC texture and encodes it with bc7e at "very slow",
+     one file per texture named by the hash of its guest bytes. It was made for one title
+     (11,739 textures). The emulator's side (look a texture up by hash, upload its BC7 levels)
+     can be ported; a store for a game exists only once someone has run the tool over that game.
 2. **zstd on each 64 KiB unit as the memory step**, inside the 2 MiB slots as they are. Measured
    on 1 GiB of what Mario Kart World had the store hold: 36% of the units would stay in memory
    at half their size, for about a fifth fewer bytes written.
