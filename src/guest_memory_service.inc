@@ -1270,6 +1270,10 @@ extern "C" void eden_guest_gpu_cached(const void* host, int delta) noexcept {
     }
     const std::size_t slot = (at - begin) / SparseSlot;
     if (slot < gpu_cached_slots) table[slot].fetch_add(delta, std::memory_order_acq_rel);
+    // A page mapped for the GPU while its unit is probed or packed would reach the GPU no-access:
+    // read it once here, on the mapping thread, so the fault handler brings it back first. From
+    // now on GpuKeepsSlot keeps the slot out of probing and packing.
+    if (delta > 0) (void)*static_cast<const volatile std::uint8_t*>(host);
 }
 
 extern "C" unsigned eden_guest_memory_wanted(void) noexcept {
@@ -1813,8 +1817,9 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
         const char* value = std::getenv("EDEN_CRAM_PACK_GPU");
         return value == nullptr || value[0] != '0';
     }();
+    // GPU-read memory is never packed, whatever EDEN_CRAM_PACK_GPU says (GpuKeepsSlot).
     if (auto* gpu_cached = gpu_cached_table.load(std::memory_order_acquire);
-        !pack_gpu && gpu_cached != nullptr && slot < gpu_cached_slots &&
+        gpu_cached != nullptr && slot < gpu_cached_slots &&
         gpu_cached[slot].load(std::memory_order_acquire) > 0) {
         pack_gpu_skips.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -2049,10 +2054,18 @@ bool GpuKeepsSlot(std::size_t slot) noexcept {
         const char* value = std::getenv("EDEN_CRAM_PACK_GPU");
         return value == nullptr || value[0] != '0';
     }();
-    if (pack_gpu) return false;
+    // Memory the GPU itself reads (DeviceMemoryManager's GPU-cached ranges) never goes no-access:
+    // a GPU read of a probed or packed unit is a GPU page fault, and the PS5 ends the process with
+    // no signal. Ocarina of Time died that way 15-70 s past its intro with 2 GB free whenever units
+    // were probed or packed, and played 14 minutes with packing off. EDEN_CRAM_PACK_GPU only
+    // decides for slots the GPU threads read on the CPU (gpu_touched), whose faults are served.
     auto* gpu_cached = gpu_cached_table.load(std::memory_order_acquire);
-    return (gpu_cached != nullptr && slot < gpu_cached_slots && gpu_cached[slot].load(std::memory_order_acquire) > 0) ||
-           (gpu_touched != nullptr && slot < gpu_cached_slots && gpu_touched[slot].load(std::memory_order_acquire) != 0);
+    if (gpu_cached != nullptr && slot < gpu_cached_slots && gpu_cached[slot].load(std::memory_order_acquire) > 0) {
+        pack_gpu_skips.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    if (pack_gpu) return false;
+    return gpu_touched != nullptr && slot < gpu_cached_slots && gpu_touched[slot].load(std::memory_order_acquire) != 0;
 }
 // Sub, backed -> packed (pack_mutex held).
 bool PackUnit(SparseRange& range, std::size_t slot, std::size_t unit) noexcept {
