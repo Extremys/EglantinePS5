@@ -396,6 +396,11 @@ const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
     std::erase_if(mesh_arenas, [&](const MeshArena& arena) {
         return arena.counted && arena.size < mesh_arena_size;
     });
+    // An arena is made for every submission still pending, and the list never shrank: a burst of
+    // submissions left 11 arenas (700 MiB of device memory) behind in Ocarina of Time's forest on
+    // a 12 GiB pool. Two idle ones are kept; the GPU is done with the rest.
+    size_t idle_arenas{};
+    std::erase_if(mesh_arenas, [&](const MeshArena& arena) { return arena.counted && ++idle_arenas > 2; });
     auto it{std::ranges::find_if(mesh_arenas, [](const MeshArena& arena) { return arena.counted; })};
     if (it == mesh_arenas.end()) {
         const auto make_buffer = [&](u64 size, VkBufferUsageFlags usage, MemoryUsage memory) {
