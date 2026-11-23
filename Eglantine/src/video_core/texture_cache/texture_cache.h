@@ -69,8 +69,11 @@ using namespace Common::Literals;
 template <class P>
 TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : runtime{runtime_}, device_memory{device_memory_} {
+    // EDEN_NX2_TC_SHAPES=1 (with EDEN_NX2_TC_LOG): the shapes of the images made in each 600 frames
+    // go to the log at the normal level, without the rest of the debug lines.
     debug_stats = std::getenv("EDEN_NX2_TC_LOG") != nullptr &&
-                  Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
+                  (std::getenv("EDEN_NX2_TC_SHAPES") != nullptr ||
+                   Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug));
 
     // Configure null sampler
     TSCEntry sampler_descriptor{};
@@ -573,6 +576,37 @@ void TextureCache<P>::TickFrame() {
                  total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20,
                  sentenced >> 20, async_decodes.size(), decode_bytes >> 20,
                  (swizzle_data_buffer.capacity() + unswizzle_data_buffer.capacity()) >> 20);
+        {
+            // What the collector could take: images unused for 2 and for 10 frames, by kind
+            // (overlapped ones go without a download, GPU-written ones are downloaded first).
+            u64 unused[2][3]{};
+            for (size_t i = 0; i < 2; ++i) {
+                const u64 age = i == 0 ? 2 : 10;
+                if (frame_tick <= age) {
+                    continue;
+                }
+                lru_cache.ForEachItemBelow(frame_tick - age, [&](ImageId image_id) {
+                    const auto& image = slot_images[image_id];
+                    const u64 bytes = GetScaledImageSizeBytes(image);
+                    unused[i][True(image.flags & ImageFlagBits::BadOverlap)    ? 0
+                              : True(image.flags & ImageFlagBits::GpuModified) ? 1
+                                                                               : 2] += bytes;
+                    return false;
+                });
+            }
+            LOG_INFO(HW_GPU,
+                     "Memory trace: unused 2 frames: {} MiB overlapped, {} MiB GPU-written, {} MiB "
+                     "other; unused 10 frames: {} MiB overlapped, {} MiB GPU-written, {} MiB other",
+                     unused[0][0] >> 20, unused[0][1] >> 20, unused[0][2] >> 20, unused[1][0] >> 20,
+                     unused[1][1] >> 20, unused[1][2] >> 20);
+        }
+        if constexpr (requires { runtime.MemoryPressureEvents(); runtime.FailedImages(); }) {
+            LOG_INFO(HW_GPU,
+                     "Memory trace: {} allocations over budget, {} images not made; margins: out of "
+                     "memory {} MiB, block slack {} MiB; retention limit {} MiB",
+                     runtime.MemoryPressureEvents(), runtime.FailedImages(), pressure_margin >> 20,
+                     slack_margin >> 20, retention_limit >> 20);
+        }
         if constexpr (requires { runtime.LogMemoryTrace(); }) {
             runtime.LogMemoryTrace();
         }
@@ -637,8 +671,19 @@ void TextureCache<P>::TickFrame() {
         std::vector<std::pair<u32, u64>> shapes;
         for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
         std::sort(shapes.rbegin(), shapes.rend());
-        for (size_t i = 0; i < std::min<size_t>(10, shapes.size()); ++i) {
+        static const bool log_shapes = std::getenv("EDEN_NX2_TC_SHAPES") != nullptr;
+        if (log_shapes) {
+            LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} shapes made", shapes.size());
+        }
+        for (size_t i = 0; i < std::min<size_t>(log_shapes ? 24 : 10, shapes.size()); ++i) {
             const u64 key = shapes[i].second;
+            if (log_shapes) {
+                LOG_INFO(HW_GPU, "  created {}x: format {} type {} levels {} layers {} {}x{} (last at {:#x})",
+                         shapes[i].first, key >> 56, (key >> 52) & 0xF, (key >> 48) & 0xF,
+                         (key >> 36) & 0xFFF, (key >> 18) & 0x3FFFF, key & 0x3FFFF,
+                         created_shapes[key].second);
+                continue;
+            }
             LOG_DEBUG(HW_GPU, "  created {}x: format {} type {} levels {} layers {} {}x{} (last at {:#x})",
                      shapes[i].first, key >> 56, (key >> 52) & 0xF, (key >> 48) & 0xF,
                      (key >> 36) & 0xFFF, (key >> 18) & 0x3FFFF, key & 0x3FFFF,
@@ -646,7 +691,8 @@ void TextureCache<P>::TickFrame() {
         }
         created_shapes.clear();
         // The per-image and per-shape tallies only feed debug lines: skip them while those are off.
-        debug_stats = Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
+        debug_stats = log_shapes ||
+                      Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }

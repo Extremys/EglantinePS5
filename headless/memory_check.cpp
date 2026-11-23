@@ -1839,6 +1839,26 @@ static void CheckReadTrapAreas() {
     std::printf("Read trap areas PASS: %u cases\n", cases);
 }
 
+// The swap file's own parts (src/guest_memory_service.inc, "Swap"): a slot there and back as it is
+// and compressed, a changed byte caught by the hash, the budget's limits, and the ledger over
+// sessions that end in order, without warning, and after midnight. Its steps are numbered in
+// eden_swap_check.
+extern "C" int eden_swap_check(const char* folder) noexcept;
+extern "C" int LZ4_versionNumber(void); // (a reference that links LZ4 in: the port's own are weak)
+static void CheckSwapFile() {
+    require(LZ4_versionNumber() > 0);
+    const char* const parent = std::getenv("TMPDIR");
+    char folder[512];
+    require(std::snprintf(folder, sizeof(folder), "%s/eden-swap-check-XXXXXX", parent != nullptr && *parent ? parent : "/tmp") <
+            static_cast<int>(sizeof(folder)));
+    require(mkdtemp(folder) != nullptr);
+    const int failed = eden_swap_check(folder);
+    if (failed != 0) std::fprintf(stderr, "Swap file: step %d failed\n", failed);
+    require(failed == 0);
+    require(rmdir(folder) == 0); // nothing is left behind: the file was unlinked while open
+    std::printf("Swap file PASS: 25 steps\n");
+}
+
 int main(int argc, char** argv) {
     // The checks run with the defaults: direct table, page reuse and fast paths on.
     CheckSparseTables();
@@ -1906,6 +1926,7 @@ int main(int argc, char** argv) {
     CheckFastPaths();
     CheckWindow64();
     CheckReadTrapAreas();
+    CheckSwapFile();
     CheckAtomicLoop(backing, false);
     CheckAtomicLoopA32(backing, false);
     CheckSharedJit(2, true, 2, true);

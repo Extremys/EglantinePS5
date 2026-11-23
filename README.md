@@ -300,9 +300,23 @@ A game can have its own values: in its settings, **Performance** (see [Settings 
 }
 ```
 
-The accuracy switches help only where a game is held back by what they relax. In the scene they were measured in on the console, a large game standing at its frame rate limit, switching all of them on changed neither the frame rate nor how busy the emulated processor and the graphics thread were. Leave them off unless a game runs under its frame rate, and switch them back off if its graphics go wrong.
+One more value has no switch in the launcher: `"gpu_clock"`, which is `"normal"`, `"boost"`, `"overclock"` or `"fixed"`. It sets how fast the GPU looks to a game: with boost (the default) the GPU's time for a frame looks 4 times shorter than it was, with overclock 16 times, with fixed 256 times. A game that picks its render resolution from that time keeps the highest one for longer the faster the GPU looks: with fixed, through frames that take seconds. Mario Kart World gets fixed unless the file says otherwise: with boost a single late frame made it change its resolution every frame, each size with render targets of its own, and graphics memory grew from 4.5 GB to 6-7 GB until the session ended (see [docs/GUEST-MEMORY-SWAP.md](docs/GUEST-MEMORY-SWAP.md)). Set it under `"performance"` for every game, or in a game's entry under `"games"` for that game.
 
-Resolution, the upscaling filter, the renderer and the refresh rate, which change speed too, are in **Settings > Video** and in a game's own settings.
+### Memory and the swap file
+
+A game's memory, its graphics memory and the emulator's own share one pool (about 13.4 GB on a PS5 Pro, 12.2 GB on a PS5). When a game fills it, EglantinePS5 first compresses memory of the game that nothing has touched for a while. Memory that does not compress, mostly texture and sound data the game keeps after the GPU has its copy, can go to a swap file on the console's storage instead, and is read back when the game touches it.
+
+The file is `guest-memory.swap` in `/data/eglantineps5/cache/`. It exists only while a game runs and is removed when the game ends, also after a crash. It is written to as little as possible, because the storage's flash wears with writes:
+
+- Nothing is written unless an allocation has already failed and asked for memory back, and then only what the pool lacks. A game that fits writes one 16 KiB test page per session.
+- Only memory nothing has read or written for a while goes to the file, and memory read back is not written again unless the game changed it. Memory the game keeps reusing goes last.
+- At most 1 GiB at once, refilled at 128 MiB a minute; at most 4 GiB a session and 8 GiB a day. `guest-memory.swap.ledger` beside the file keeps the day's and the lifetime's totals, and is charged before the writes it counts. With the budget used up nothing more is written and the game runs as it did before.
+- The file is never larger than 2 GiB and is not made when the storage has less than 8 GiB free.
+- Everything read back is checked against a hash taken when it was written.
+
+On a PS5 Pro, Mario Kart World wrote nothing in its first races and 2.3 GiB in a 30-minute session, which ends after 10 minutes without the file; The Legend of Zelda: Ocarina of Time wrote nothing.
+
+`"swap_file": false` under `"performance"` in the settings file switches it off for every game. The other limits are listed in [docs/GUEST-MEMORY-SWAP.md](docs/GUEST-MEMORY-SWAP.md), with what was measured.
 
 ### Frame generation
 
