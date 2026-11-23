@@ -365,8 +365,13 @@ void PlaceSecondary(const char* name) {
         }();
         const unsigned long long shared =
             forced_shared != 0 ? forced_shared
-            : back_core >= 0 && back_started.load(std::memory_order_relaxed) ? secondary_cpus & ~(3ULL << back_core)
-                                                                             : secondary_cpus;
+            // The back's whole core is kept from the start. Kept only once the back existed, every
+            // thread placed before it (the Vulkan worker, shader compilers, texture decoder, audio,
+            // file system: mask 1caa) could still run on the back's CPU and its SMT sibling, and the
+            // back is the thread a heavy scene waits for (Ocarina of Time's forest: back 94% busy,
+            // 18.1 fps; 20.0 with mask 10aa for all of them).
+            : back_core >= 0 ? secondary_cpus & ~(3ULL << back_core)
+                             : secondary_cpus;
         static const long back_cpu = [] {
             const char* value = std::getenv("EDEN_BACK_CPU");
             return value != nullptr ? static_cast<long>(std::strtoul(value, nullptr, 10)) : long{back_core};
