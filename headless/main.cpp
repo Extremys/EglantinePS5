@@ -1338,6 +1338,9 @@ int main(int argc, char** argv) {
             }
             const auto speed = Eden::LoadPerformance(eden_game_title_id(guest));
             Settings::values.use_asynchronous_shaders = speed.async_shaders;
+            // EDEN_ASYNC_SHADERS=0/1 (env.txt) overrides the Performance switch for a run.
+            if (const char* value = std::getenv("EDEN_ASYNC_SHADERS"))
+                Settings::values.use_asynchronous_shaders = value[0] == '1';
             if (speed.fast_gpu) {
                 // Nothing calls UpdateGPUAccuracy() here; set the live value too.
                 Settings::values.gpu_accuracy.SetValue(Settings::GpuAccuracy::Low);
