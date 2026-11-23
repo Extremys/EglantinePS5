@@ -1299,18 +1299,20 @@ int main(int argc, char** argv) {
                     // its pixels (blue, blinking trees). RADV's zerovram: a frame dump at 225 s had
                     // no NaN in the scene, against 1.1 million pixels without it.
                     if (!std::getenv("RADV_DEBUG")) setenv("RADV_DEBUG", "zerovram", 1);
-                    // No packing: probing and packing guest memory (no-access units) ended the
-                    // process without a signal 15-70 s past the first scene even with 2 GB free;
-                    // with EDEN_CRAM_PACK=0 the same build played 28 minutes and on. The 64 KiB
-                    // backing stays (guest held ~5.5 GB, ~700 MiB free, steady). The texture cache
-                    // keeps under 2-2.5 GiB and the pager's reserves stay small so the pool has
-                    // room. All of these yield to env.txt.
-                    setenv("EDEN_CRAM_PACK", "0", 0);
+                    // The driver's memory trim (radv_ps5_eden_trim, called before each packing pass
+                    // and on recovery) took device memory back while the GPU still read it: the
+                    // kernel log shows "GPU Protection fault ... Unmapped page access" in the
+                    // driver's region (0x40_xxxxxxxx) and ends the process (GPU_FAULT_PAGE_FAULT_ASYNC),
+                    // and before that the scene went white with garbage HUD textures. With the trim
+                    // off (an hour's quarantine) packing is safe, GPU-mapped slots included: the
+                    // same scene is right with the guest at 3.3 GB against 5.7 GB unpacked.
+                    setenv("RADV_PS5_TRIM_QUARANTINE_MS", "3600000", 0);
+                    setenv("EDEN_CRAM_KEEP_GPU_MAPPED", "0", 0);
                     setenv("EDEN_CRAM_RESERVE_MIB", "128", 0);
                     setenv("EDEN_CRAM_UNPACK_KEEP_MIB", "64", 0);
                     setenv("EDEN_NX2_TC_EXPECTED_MIB", "2048", 0);
                     setenv("EDEN_NX2_TC_CRITICAL_MIB", "2560", 0);
-                    setenv("EDEN_CRAM_PACK_BELOW_MIB", "12288", 0); // used only if packing is turned back on
+                    setenv("EDEN_CRAM_PACK_BELOW_MIB", "12288", 0); // pack from the start
                 } else if (fallback_ours && eden_game_title_id(guest) != 0x0400486024DEC000ULL) {
                     unsetenv("EDEN_NX2_FORCE_MESH_FALLBACK");
                     fallback_ours = false;
