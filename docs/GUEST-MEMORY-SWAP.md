@@ -82,9 +82,9 @@ Three things are not as in Lichii, each because of a measurement on this port:
   less than a quarter of its size left (`EDEN_SWAP_START_OVER_HOURS`; `started` in its folder
   holds when it last did). Lichii's takes nothing new once it is full. Mario Kart World's memory
   differs from session to session (a third of what a session sends is found again in the next),
-  so it fills 8 GiB in about two hours of play and would then have no store left to send
-  anything new to. A session that starts with less than a quarter of the store left is one that
-  ends at its next large need, which is why the store does not wait until it is full.
+  so it fills 8 GiB in little more than an hour of play and would then have no store left to
+  send anything new to. A session that starts with less than a quarter of the store left is one
+  that ends at its next large need, which is why the store does not wait until it is full.
 
 The memory step before the store is this port's own too: LZ4 on a whole slot, kept in memory at
 60% or less, where Lichii has zstd on each 64 KiB unit, kept at 75% or less. What that would
@@ -420,10 +420,10 @@ not more swap.
 The pool gets short (its largest free block goes down to 1.0 GB, and 3.0 GB of the game's memory
 sit Idle), no allocation is refused, and nothing is written. `main` ran the same scene at 33.2
 and 33.7 FPS (2 runs; by the game's frames, which gives 33.5 for the store's runs and 33.6 to
-34.2 for the first design's six). With its pipeline cache removed (the game's own squeeze used to be the heap while
-pipelines compile at the scene's load) it was the same with the first design: 33.4 and 33.8
-FPS, 33.1 on `main`, the pool's largest free block never under 0.8 GB, nothing written. In none
-of these runs did Ocarina of Time need swap.
+34.2 for the first design's six). With its pipeline cache removed (the game's own squeeze used
+to be the heap while pipelines compile at the scene's load) it was the same with the first
+design: 33.4 and 33.8 FPS, 33.1 on `main`, the pool's largest free block never under 0.8 GB,
+nothing written. In none of these runs did Ocarina of Time need swap.
 
 ### Donkey Kong Bananza
 
@@ -490,8 +490,8 @@ deleted.
   by its size where the ledger counted them.
 - **Lichii's pass as the default**, and **Lichii's budget**: both under [The store](#the-store),
   with the sessions that ended early in the table above.
-- **A store that starts over whenever it is full.** Mario Kart World fills 8 GiB in about two
-  hours of play, so a day of it would have written the store several times over. Once a day
+- **A store that starts over whenever it is full.** Mario Kart World fills 8 GiB in little more
+  than an hour of play, so a day of it would have written the store several times over. Once a day
   bounds what the storage takes; the price is that Mario Kart World's long sessions end early
   for the rest of a day in which the store has been filled.
 - **Writing ahead of need** in the first design (slots idle for 30 s went to the file while the
@@ -517,11 +517,11 @@ deleted.
 - **The texture array.** The largest single need is a decoded texture array per track:
   1434x1434, 46 layers, 560 MiB as RGBA8, asked for in one piece. Late in a session most of
   what is written is written to make room for it and for its 128 MiB staging buffer (in the
-  second session above, 729 MiB went to the store within the 30 s of one such load, and then
-  seven smaller requests found no slot left to take). Keeping that array compressed for the GPU
-  is a change to the texture cache, not to swap, and would save more than anything left in the
-  swap policy. (Upstream Eglantine backs Mario Kart World's oversized lightmaps at lower detail
-  since its #2459; whether that is this array was not looked into.)
+  2nd session on another store above, 729 MiB went to the store within the 30 s of one such
+  load, and then seven smaller requests found no slot left to take). Keeping that array
+  compressed for the GPU is a change to the texture cache, not to swap, and would save more
+  than anything left in the swap policy. (Upstream Eglantine backs Mario Kart World's oversized
+  lightmaps at lower detail since its #2459; whether that is this array was not looked into.)
 - **Lichii's memory step.** There a unit stays in memory when zstd (level 1) brings it to 48 of
   its 64 KiB or less, and goes to the store otherwise. Here a slot stays in memory when LZ4
   brings all of its 2 MiB to 60% or less. Measured on what Mario Kart World had the store hold

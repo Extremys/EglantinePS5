@@ -517,11 +517,11 @@ bool SwapStart() noexcept {
     // not more often than every EDEN_SWAP_START_OVER_HOURS (24; `started` in its folder holds when
     // it last did). Lichii's stays as it is once it is full and takes only what it holds already
     // (EDEN_SWAP_START_OVER_HOURS=0 here). A game whose memory differs from one session to the next
-    // (Mario Kart World: a third of what a session sends is found again in the next, and a
-    // 30-minute session adds about 2 GiB) fills 8 GiB in two hours of play, and would have no
-    // store left to send anything new to. A quarter, because a session that starts with less room
-    // than that is one that ends at its next large need. So the storage takes at most the store's
-    // size for each time it starts, and it starts once a day at most.
+    // (Mario Kart World: a third of what a session sends is found again in the next, a 30-minute
+    // session adds about 2 GiB and an hour 7) fills 8 GiB in little more than an hour of play, and
+    // would have no store left to send anything new to. A quarter, because a session that starts
+    // with less room than that is one that ends at its next large need. So the storage takes at
+    // most the store's size for each time it starts, and it starts once a day at most.
     //
     // That bound is only as good as `started`, so the time goes to the storage first, and for
     // good, and a store whose time cannot be written does not start over. A time from after now
