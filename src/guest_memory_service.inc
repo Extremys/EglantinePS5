@@ -1831,9 +1831,14 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
         const char* value = std::getenv("EDEN_CRAM_PACK_GPU");
         return value == nullptr || value[0] != '0';
     }();
-    // GPU-read memory is never packed, whatever EDEN_CRAM_PACK_GPU says (GpuKeepsSlot).
+    // GPU-read memory is never packed, whatever EDEN_CRAM_PACK_GPU says (GpuKeepsSlot), unless
+    // EDEN_CRAM_KEEP_GPU_MAPPED=0.
+    static const bool keep_mapped = [] {
+        const char* value = std::getenv("EDEN_CRAM_KEEP_GPU_MAPPED");
+        return value == nullptr || value[0] != '0';
+    }();
     if (auto* gpu_cached = gpu_cached_table.load(std::memory_order_acquire);
-        gpu_cached != nullptr && slot < gpu_cached_slots &&
+        keep_mapped && gpu_cached != nullptr && slot < gpu_cached_slots &&
         gpu_cached[slot].load(std::memory_order_acquire) > 0) {
         pack_gpu_skips.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -2073,8 +2078,15 @@ bool GpuKeepsSlot(std::size_t slot) noexcept {
     // no signal. Ocarina of Time died that way 15-70 s past its intro with 2 GB free whenever units
     // were probed or packed, and played 14 minutes with packing off. EDEN_CRAM_PACK_GPU only
     // decides for slots the GPU threads read on the CPU (gpu_touched), whose faults are served.
+    // EDEN_CRAM_KEEP_GPU_MAPPED=0: pack GPU-mapped slots too (an experiment: in OoT they are most of
+    // the guest's memory, 3.3 GB, and the kill was seen before the race, split and buffer-touch fixes).
+    static const bool keep_mapped = [] {
+        const char* value = std::getenv("EDEN_CRAM_KEEP_GPU_MAPPED");
+        return value == nullptr || value[0] != '0';
+    }();
     auto* gpu_cached = gpu_cached_table.load(std::memory_order_acquire);
-    if (gpu_cached != nullptr && slot < gpu_cached_slots && gpu_cached[slot].load(std::memory_order_acquire) > 0) {
+    if (keep_mapped && gpu_cached != nullptr && slot < gpu_cached_slots &&
+        gpu_cached[slot].load(std::memory_order_acquire) > 0) {
         pack_gpu_skips.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
