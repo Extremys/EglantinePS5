@@ -135,11 +135,10 @@ Also in the way:
 
 ## Untested
 
-Everything. In the order of what is most likely to be wrong:
+Everything the store does. In the order of what is most likely to be wrong:
 
-1. **It has not been built.** The changed translation units (`vk_texture_cache.cpp`, the Vulkan and OpenGL
-   texture cache instantiations, `util.cpp`) passed a syntax-only compile with the PS5 target's flags: no object
-   code, no link, no run.
+1. **The store's path has not run.** The code builds and the build ran on the console, without a store folder:
+   nothing after the first line of a lookup has been executed.
 2. **No store exists for any game on this console**, so no lookup has ever matched here. That a key made by the
    tool equals the hash the emulator takes rests on Lichii's results with one game on Lichii's core, and on the
    size computation being the same code in both cores (it was compared and is).
