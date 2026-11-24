@@ -4254,7 +4254,13 @@ void KeepFree() noexcept {
     const std::uint64_t now = SwapNow();
     if (below_since == 0) below_since = now;
     const bool write = may_write && (now - below_since >= 3'000'000'000ull || free_pieces < mark / 4);
-    (void)RecoverMemory(mark + (std::size_t{256} << 20) - free_pieces, false, true, write ? 2 : 1);
+    // (EglantinePS5) At most EDEN_SWAP_KEEPER_CHUNK_MIB (64) a call: the call holds pack_mutex, and
+    // a failed allocation's request waits for it. Asked for the whole 768 MiB at once, the keeper
+    // wrote 596 MiB in one call and Ocarina of Time's GPU thread waited 6 s for it.
+    static const std::size_t chunk = EnvOr("EDEN_SWAP_KEEPER_CHUNK_MIB", 64) << 20;
+    std::size_t want = mark + (std::size_t{256} << 20) - free_pieces;
+    if (chunk != 0) want = std::min(want, chunk);
+    (void)RecoverMemory(want, false, true, write ? 2 : 1);
 #endif
 }
 } // namespace
