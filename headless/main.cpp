@@ -1347,6 +1347,11 @@ int main(int argc, char** argv) {
                     // several times a second, the GPU wrote to one just given back (kernel: GPU
                     // Protection fault, unmapped page access in the driver's range, Write).
                     setenv("RADV_PS5_TRIM_QUARANTINE_MS", "10000", 0);
+                    // The swap store's keeper writes slots left cold once the pool has been short for 3 s, so a
+                    // failed allocation rarely has to wait for writes: this game does not write them again.
+                    // In 25-minute roams the frames of 0.5 to 1.2 s that came with each burst of writes
+                    // after a failed allocation went (33.6 FPS mean, 1.3 GiB written).
+                    setenv("EDEN_SWAP_KEEPER", "1", 0);
                 } else if (fallback_ours && eden_game_title_id(guest) != 0x0400486024DEC000ULL) {
                     unsetenv("EDEN_NX2_FORCE_MESH_FALLBACK");
                     fallback_ours = false;
