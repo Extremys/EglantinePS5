@@ -183,23 +183,39 @@ int main() {
     std::ofstream(unknown_output) << R"({"video": {"output_resolution": "720p"}})";
     assert(Eden::LoadPreferences(unknown_output).output == 0);
 
-    // Frame generation (Settings > Video): off unless chosen, and a switch, so the file holds a
-    // boolean. Vulkan only, but the setting itself is stored like any other.
+    // Frame generation (Settings > Video): on by default with MihawkGen (it needs nothing from the
+    // user), and a switch, so the file holds a boolean. Vulkan only, but the setting itself is
+    // stored like any other.
     video = Eden::LoadPreferences(file);
-    assert(!video.frame_gen);
-    video.frame_gen = true;
-    assert(Eden::SavePreferences(video, file) && Eden::LoadPreferences(file).frame_gen);
-    assert(Read(file).find("\"frame_gen\": true") != std::string::npos);
+    assert(video.frame_gen && video.frame_gen_type == Eden::kFrameGenTypeMihawk &&
+           Eden::kFrameGenTypeKeys[video.frame_gen_type] == std::string("mihawk"));
+    assert(Eden::LoadPreferences(std::string(directory) + "/no-such-settings.json").frame_gen);
+    assert(Read(file).find("\"frame_gen_default\": \"mihawk\"") != std::string::npos);
     video.frame_gen = false;
     assert(Eden::SavePreferences(video, file) && !Eden::LoadPreferences(file).frame_gen);
-    // The frame generation type: AMD FSR 3 by default (it needs nothing from the user), Lossless
-    // Scaling when chosen; the filter list's new AMD FSR 3 keeps the older entries' indexes.
-    assert(video.frame_gen_type == 0 && Eden::kFrameGenTypeKeys[video.frame_gen_type] == std::string("fsr3"));
+    assert(Read(file).find("\"frame_gen\": false") != std::string::npos);
+    video.frame_gen = true;
+    assert(Eden::SavePreferences(video, file) && Eden::LoadPreferences(file).frame_gen);
+    // A file from before MihawkGen was the default (no frame_gen_default mark) gets it, on, once;
+    // a Lossless Scaling choice in such a file is kept.
+    const std::string before_mihawk = std::string(directory) + "/before-mihawk.json";
+    std::ofstream(before_mihawk) << R"({"video": {"frame_gen": false, "frame_gen_type": "fsr3"}})";
+    assert(Eden::LoadPreferences(before_mihawk).frame_gen &&
+           Eden::LoadPreferences(before_mihawk).frame_gen_type == Eden::kFrameGenTypeMihawk);
+    std::ofstream(before_mihawk) << R"({"video": {"frame_gen": false, "frame_gen_type": "lsfg"}})";
+    assert(!Eden::LoadPreferences(before_mihawk).frame_gen &&
+           Eden::LoadPreferences(before_mihawk).frame_gen_type == 1);
+    std::ofstream(before_mihawk) << R"({"video": {"frame_gen": false, "frame_gen_type": "fsr3", "frame_gen_default": "mihawk"}})";
+    assert(!Eden::LoadPreferences(before_mihawk).frame_gen &&
+           Eden::LoadPreferences(before_mihawk).frame_gen_type == 0);
+    // The frame generation type: AMD FSR 3, Lossless Scaling and MihawkGen keep their indexes.
+    video.frame_gen_type = 0;
+    assert(Eden::SavePreferences(video, file) && Eden::LoadPreferences(file).frame_gen_type == 0);
     assert(Read(file).find("\"frame_gen_type\": \"fsr3\"") != std::string::npos);
     video.frame_gen_type = 1;
     assert(Eden::SavePreferences(video, file) && Eden::LoadPreferences(file).frame_gen_type == 1);
     assert(Read(file).find("\"frame_gen_type\": \"lsfg\"") != std::string::npos);
-    video.frame_gen_type = 2;
+    video.frame_gen_type = 3;
     assert(!Eden::SavePreferences(video, file));
     video.frame_gen_type = 0;
     assert(Eden::SavePreferences(video, file));
@@ -318,12 +334,18 @@ int main() {
     assert(game.frame_gen == 1 && game.resolution == 4 &&
            Eden::LoadGameSettings(quest, file).frame_gen == -1);
     assert(Eden::PreferencesFor(racer, file).frame_gen);
-    assert(!Eden::PreferencesFor(quest, file).frame_gen);
+    assert(Eden::PreferencesFor(quest, file).frame_gen == Eden::LoadPreferences(file).frame_gen);
     game.frame_gen = -1;
     assert(Eden::SaveGameSettings(racer, game, file) &&
            Eden::LoadGameSettings(racer, file).frame_gen == -1);
     game.frame_gen = 2;
     assert(!Eden::SaveGameSettings(racer, game, file));
+    // A game's own "off" wins over Settings' default "on".
+    game.frame_gen = 0;
+    assert(Eden::SaveGameSettings(racer, game, file) && !Eden::PreferencesFor(racer, file).frame_gen &&
+           Eden::PreferencesFor(quest, file).frame_gen);
+    game.frame_gen = -1;
+    assert(Eden::SaveGameSettings(racer, game, file));
 
     // A game's own frame generation type, on top of Settings' (-1 follows Settings).
     assert(Eden::LoadGameSettings(racer, file).frame_gen_type == -1);
@@ -334,6 +356,8 @@ int main() {
     assert(Eden::LoadGameSettings(racer, file).frame_gen_type == 1);
     assert(Eden::PreferencesFor(racer, file).frame_gen_type == 1 && Eden::PreferencesFor(quest, file).frame_gen_type == 0);
     game.frame_gen_type = 2;
+    assert(Eden::SaveGameSettings(racer, game, file) && Eden::PreferencesFor(racer, file).frame_gen_type == 2);
+    game.frame_gen_type = 3;
     assert(!Eden::SaveGameSettings(racer, game, file));
     game.frame_gen_type = -1;
     assert(Eden::SaveGameSettings(racer, game, file) && Eden::LoadGameSettings(racer, file).frame_gen_type == -1);
