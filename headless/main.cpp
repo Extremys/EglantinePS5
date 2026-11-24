@@ -1342,6 +1342,11 @@ int main(int argc, char** argv) {
                     setenv("EDEN_NX2_TC_EXPECTED_MIB", "2048", 0);
                     setenv("EDEN_NX2_TC_CRITICAL_MIB", "2560", 0);
                     setenv("EDEN_CRAM_PACK_BELOW_MIB", "12288", 0); // pack from the start
+                    // The driver gives a granule back once nothing has been bound to it for this long.
+                    // With 2 s, 20 minutes into a session with 14 to 86 MiB free and memory asked back
+                    // several times a second, the GPU wrote to one just given back (kernel: GPU
+                    // Protection fault, unmapped page access in the driver's range, Write).
+                    setenv("RADV_PS5_TRIM_QUARANTINE_MS", "10000", 0);
                 } else if (fallback_ours && eden_game_title_id(guest) != 0x0400486024DEC000ULL) {
                     unsetenv("EDEN_NX2_FORCE_MESH_FALLBACK");
                     fallback_ours = false;
