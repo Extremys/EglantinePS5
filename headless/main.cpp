@@ -1195,10 +1195,14 @@ int main(int argc, char** argv) {
                 const bool active = (override_rate >= 0 || override_multiplier >= 0 || video.frame_gen) &&
                                     video.backend == Eden::GraphicsBackend::Vulkan;
                 Settings::values.frame_gen.SetValue(active);
-                // AMD FSR 3 (Eglantine's own, nothing needed from the user) or Lossless Scaling's.
+                // AMD FSR 3 (Eglantine's own, nothing needed from the user), Lossless Scaling's or
+                // MihawkGen's network (kFrameGenTypeKeys order).
+                static constexpr Settings::FrameGenType kTypes[] = {
+                    Settings::FrameGenType::Fsr3, Settings::FrameGenType::Lsfg, Settings::FrameGenType::Mihawk};
+                static_assert(std::size(kTypes) == std::size(Eden::kFrameGenTypeKeys));
+                Settings::values.frame_gen_type.SetValue(
+                    kTypes[std::clamp(video.frame_gen_type, 0, int(std::size(kTypes)) - 1)]);
                 const bool lossless = video.frame_gen_type == 1;
-                Settings::values.frame_gen_type.SetValue(lossless ? Settings::FrameGenType::Lsfg
-                                                                  : Settings::FrameGenType::Fsr3);
                 Settings::values.frame_gen_target_rate.SetValue(
                     active ? static_cast<unsigned>(std::min(target, 240)) : 0u);
                 Settings::values.frame_gen_multiplier.SetValue(
@@ -1219,7 +1223,7 @@ int main(int argc, char** argv) {
                         "not a PE",   "no LSFG shaders in it",      "shader translation failed",
                         "shader cache unusable"};
                     Eden::Report("launch",
-                                 ("Frame generation (" + std::string(lossless ? "Lossless Scaling" : "AMD FSR 3") + "): " +
+                                 ("Frame generation (" + std::string(Eden::kFrameGenTypeLabels[std::clamp(video.frame_gen_type, 0, int(std::size(Eden::kFrameGenTypeLabels)) - 1)]) + "): " +
                                   std::string(target > 0 ? std::to_string(target) + " Hz target"
                                                          : std::to_string(multiplier) + "x multiplier") +
                                   (lossless ? "; " + folder.string() + ": " +

@@ -6,8 +6,9 @@
 //     "video": { "renderer": "vulkan", "fps_overlay": true, "fps_overlay_size": "regular",
 //                "fps_overlay_corner": "top_left", "fps_overlay_fields": 207, "resolution": "1x",
 //                "upscaling_filter": "bilinear", "refresh_rate": "60",
-//                "output_resolution": "1080p", "frame_gen": false,
-//                "frame_gen_target": "auto", "frame_gen_multiplier": "2" },
+//                "output_resolution": "1080p", "frame_gen": true,
+//                "frame_gen_type": "mihawk", "frame_gen_target": "auto",
+//                "frame_gen_multiplier": "2", "frame_gen_default": "mihawk" },
 //     "audio": { "volume": 100, "mute": false, "menu_volume": 70 },
 //     "controls": { "vibration": true, "vibration_strength": 100,
 //                   "mapping": { "a": "cross", "b": "circle" } },
@@ -88,10 +89,13 @@ inline constexpr int kRefreshHz[] = {60, 120};
 inline constexpr const char* kFrameGenTargetKeys[] = {"auto", "60", "90", "120", "144", "240"};
 inline constexpr int kFrameGenTargetHz[] = {0, 60, 90, 120, 144, 240};
 static_assert(std::size(kFrameGenTargetKeys) == std::size(kFrameGenTargetHz));
-// What makes the frames: Eglantine's own FSR 3 frame generation, or Lossless Scaling's (it needs
-// the user's own Lossless.dll). Eglantine's default is FSR 3, which needs nothing from the user.
-inline constexpr const char* kFrameGenTypeKeys[] = {"fsr3", "lsfg"};
-inline constexpr const char* kFrameGenTypeLabels[] = {"AMD FSR 3", "Lossless Scaling"};
+// What makes the frames: Eglantine's own FSR 3 frame generation, Lossless Scaling's (it needs
+// the user's own Lossless.dll), or MihawkGen's neural network (Eglantine/externals/mihawkgen).
+// Eglantine's default is MihawkGen, on: it needs nothing from the user and no game data (it
+// works from the presented colour alone).
+inline constexpr int kFrameGenTypeMihawk = 2;
+inline constexpr const char* kFrameGenTypeKeys[] = {"fsr3", "lsfg", "mihawk"};
+inline constexpr const char* kFrameGenTypeLabels[] = {"AMD FSR 3", "Lossless Scaling", "MihawkGen"};
 static_assert(std::size(kFrameGenTypeLabels) == std::size(kFrameGenTypeKeys));
 inline constexpr const char* kFrameGenMultiplierKeys[] = {"2", "3", "4"};
 inline constexpr int kFrameGenMultiplierValue[] = {2, 3, 4};
@@ -142,8 +146,8 @@ struct Preferences {
     int upscaling_filter = 0;            // index into kUpscalingFilterKeys
     int refresh = 0;                     // index into kRefreshKeys
     int output = 0;                      // index into kOutputKeys
-    bool frame_gen = false;              // frame generation (Vulkan only)
-    int frame_gen_type = 0;              // index into kFrameGenTypeKeys (0 is AMD FSR 3)
+    bool frame_gen = true;               // frame generation (Vulkan only)
+    int frame_gen_type = kFrameGenTypeMihawk;  // index into kFrameGenTypeKeys (2 is MihawkGen)
     int frame_gen_target = 0;            // index into kFrameGenTargetKeys (0 is "auto")
     int frame_gen_multiplier = 0;        // index into kFrameGenMultiplierKeys (0 is 2x)
     bool vibration = true;
@@ -405,6 +409,14 @@ inline Preferences LoadPreferences(const std::string& file = SettingsFile()) {
     result.frame_gen_multiplier = KeyIndex(
         Settings::String(document, Json::json_pointer("/video/frame_gen_multiplier")),
         kFrameGenMultiplierKeys, int(std::size(kFrameGenMultiplierKeys)), result.frame_gen_multiplier);
+    // A file saved before MihawkGen became the default (no "frame_gen_default" in it) holds the
+    // old defaults, off and AMD FSR 3, whether or not anyone chose them: it gets MihawkGen, on,
+    // once (the next save writes the mark). A user's own Lossless Scaling is kept.
+    if (!document.contains(Json::json_pointer("/video/frame_gen_default")) &&
+        result.frame_gen_type != 1) {
+        result.frame_gen = true;
+        result.frame_gen_type = kFrameGenTypeMihawk;
+    }
     result.vibration = Settings::Bool(document, Json::json_pointer("/controls/vibration"), result.vibration);
     // A strength between the steps reads as the step below it; out of range as the nearest end.
     result.vibration_strength = std::clamp(
@@ -453,6 +465,7 @@ inline bool SavePreferences(const Preferences& value, const std::string& file = 
     document["video"]["frame_gen_type"] = kFrameGenTypeKeys[value.frame_gen_type];
     document["video"]["frame_gen_target"] = kFrameGenTargetKeys[value.frame_gen_target];
     document["video"]["frame_gen_multiplier"] = kFrameGenMultiplierKeys[value.frame_gen_multiplier];
+    document["video"]["frame_gen_default"] = kFrameGenTypeKeys[kFrameGenTypeMihawk];
     document["audio"]["volume"] = value.volume;
     document["audio"]["mute"] = value.mute;
     document["audio"]["menu_volume"] = value.menu_volume;
