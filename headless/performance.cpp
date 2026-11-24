@@ -208,7 +208,7 @@ bool AdjacentCpusShareCore() {
         if (others > 0 && (apart < 0 || others < apart)) apart = others;
     }
     const bool share = together > 0 && apart > 0 && together * 4 >= apart * 5;
-    std::printf("EDEN_WORKER_SMT cpus_0_1_ns=%lld cpus_0_2_ns=%lld share=%d\n", together, apart, share);
+    std::fprintf(stderr, "EDEN_WORKER_SMT cpus_0_1_ns=%lld cpus_0_2_ns=%lld share=%d\n", together, apart, share);
     return share;
 }
 std::array<unsigned, 5> worker_cpus{};
@@ -226,7 +226,7 @@ void CheckWorkerTopology() {
     // Probe once per process. Later games start from a launcher thread that the first game's
     // placement left on the secondary CPUs, where the probe finds too few cores.
     if (worker_topology_ready) {
-        std::printf("EDEN_WORKER_TOPOLOGY ready=1 cached=1 cpus=%u,%u,%u,%u,%u\n",
+        std::fprintf(stderr, "EDEN_WORKER_TOPOLOGY ready=1 cached=1 cpus=%u,%u,%u,%u,%u\n",
             worker_cpus[0], worker_cpus[1], worker_cpus[2], worker_cpus[3], worker_cpus[4]);
         return;
     }
@@ -301,9 +301,9 @@ void CheckWorkerTopology() {
             const bool pinned = std::find(worker_cpus.begin(), worker_cpus.end(), cpu) != worker_cpus.end();
             if (!pinned && cpu_core[cpu] != static_cast<int>(cores[4])) secondary_cpus |= 1ULL << cpu;
         }
-        std::printf("EDEN_WORKER_SECONDARY mask=%llx\n", secondary_cpus);
+        std::fprintf(stderr, "EDEN_WORKER_SECONDARY mask=%llx\n", secondary_cpus);
     }
-    std::printf("EDEN_WORKER_TOPOLOGY ready=%d distinct_cores=%u cpus=%u,%u,%u,%u,%u measured=%d\n",
+    std::fprintf(stderr, "EDEN_WORKER_TOPOLOGY ready=%d distinct_cores=%u cpus=%u,%u,%u,%u,%u measured=%d\n",
         worker_topology_ready, count, worker_cpus[0], worker_cpus[1], worker_cpus[2], worker_cpus[3], worker_cpus[4],
         static_cast<int>(measured));
 }
@@ -388,7 +388,7 @@ void PlaceSecondary(const char* name) {
         if (cpus & (1ULL << cpu)) CPU_SET(cpu, &mask);
     const int result = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &mask);
     if (secondary_reports.fetch_add(1, std::memory_order_relaxed) < 64)
-        std::printf("EDEN_WORKER_PLACED name=%s mask=%llx error=%d\n", name, cpus, result ? errno : 0);
+        std::fprintf(stderr, "EDEN_WORKER_PLACED name=%s mask=%llx error=%d\n", name, cpus, result ? errno : 0);
 }
 void PinWorker(unsigned index, cpuset_t& affinity) {
     if (!worker_topology_ready || index >= worker_cpus.size()) return;
@@ -400,7 +400,7 @@ void PinWorker(unsigned index, cpuset_t& affinity) {
     cpuset_t one{}, verified{};
     CPU_SET(cpu, &one);
     if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &one)) {
-        std::printf("EDEN_WORKER_PIN name=%s error=%d\n", names[index], errno);
+        std::fprintf(stderr, "EDEN_WORKER_PIN name=%s error=%d\n", names[index], errno);
         return;
     }
     if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &verified) ||
@@ -410,7 +410,7 @@ void PinWorker(unsigned index, cpuset_t& affinity) {
         return;
     }
     affinity = verified;
-    std::printf("EDEN_WORKER_PIN name=%s cpu=%u verified=1\n", names[index], cpu);
+    std::fprintf(stderr, "EDEN_WORKER_PIN name=%s cpu=%u verified=1\n", names[index], cpu);
 }
 #endif
 bool cpu_clocks_valid = false;
@@ -502,7 +502,7 @@ void SetSecondaryPlacement(bool enabled) {
         mask = topology_allowed;
     }
     const int result = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &mask);
-    std::printf("EDEN_WORKER_INHERIT enabled=%d mask=%llx error=%d\n", enabled,
+    std::fprintf(stderr, "EDEN_WORKER_INHERIT enabled=%d mask=%llx error=%d\n", enabled,
                 enabled ? secondary_cpus : 0ULL, result ? errno : 0);
 #else
     (void)enabled;
@@ -996,9 +996,6 @@ void RegisterWorker(const char* name) {
     MkwNativeSample::Register(name);
 #endif
     Eden::Crash::NameThread(name);  // a crash report names the thread
-#if defined(EDEN_DEV_PROFILE) && defined(PS5_NATIVE)
-    Eden::Stall::NoteThread(name);
-#endif
     for (unsigned i = 0; i < names.size(); ++i) {
         if (std::strcmp(name, names[i])) continue;
         Worker worker;

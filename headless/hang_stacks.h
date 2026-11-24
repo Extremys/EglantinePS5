@@ -83,11 +83,16 @@ inline void OnSignal(int, siginfo_t*, void* context) {
                 unsigned found = 2;
                 std::uintptr_t at = rsp & ~std::uintptr_t{7};
                 const std::uintptr_t to = at + 8192 < slots[i].high ? at + 8192 : slots[i].high;
-                for (; at >= slots[i].low && at + 8 <= to && found < SampleWords; at += 8) {
+                // The last word: the thread's own CPU time in microseconds (only the thread itself
+                // can read its clock on the console), for how busy it was between samples.
+                for (; at >= slots[i].low && at + 8 <= to && found < SampleWords - 1; at += 8) {
                     const std::uintptr_t value = *reinterpret_cast<const std::uintptr_t*>(at);
                     if (value > code && value < code_end) out[found++] = value;
                 }
-                while (found < SampleWords) out[found++] = 0;
+                while (found < SampleWords - 1) out[found++] = 0;
+                timespec cpu{};
+                clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu);
+                out[SampleWords - 1] = std::uintptr_t(cpu.tv_sec) * 1000000u + std::uintptr_t(cpu.tv_nsec) / 1000u;
                 slots[i].sample_count.store(n + 1, std::memory_order_release);
             }
             return;
@@ -177,7 +182,12 @@ inline void Sample(const char* names) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         const unsigned n = slot.sample_count.load(std::memory_order_acquire);
         for (std::size_t i = 0; i < std::size_t{n} * SampleWords; ++i) {
-            if (i % SampleWords != 0) samples[i] = samples[i] > code && samples[i] < code_end ? samples[i] - code : 0;
+            // Word 1 (rip) outside the program is kept as it is: JIT code or the system's.
+            if (i % SampleWords == 1) {
+                if (samples[i] > code && samples[i] < code_end) samples[i] -= code;
+            } else if (i % SampleWords != 0 && i % SampleWords != SampleWords - 1) {
+                samples[i] = samples[i] > code && samples[i] < code_end ? samples[i] - code : 0;
+            }
         }
         std::fprintf(file, "THREAD %s %u %u\n", slot.name, n, SampleWords);
         std::fwrite(samples, sizeof(std::uintptr_t), std::size_t{n} * SampleWords, file);
