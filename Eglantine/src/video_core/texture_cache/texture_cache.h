@@ -69,8 +69,11 @@ using namespace Common::Literals;
 template <class P>
 TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : runtime{runtime_}, device_memory{device_memory_} {
+    // EDEN_NX2_TC_SHAPES=1 (with EDEN_NX2_TC_LOG): the shapes of the images made in each 600 frames
+    // go to the log at the normal level, without the rest of the debug lines.
     debug_stats = std::getenv("EDEN_NX2_TC_LOG") != nullptr &&
-                  Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
+                  (std::getenv("EDEN_NX2_TC_SHAPES") != nullptr ||
+                   Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug));
 
     // Configure null sampler
     TSCEntry sampler_descriptor{};
@@ -573,6 +576,37 @@ void TextureCache<P>::TickFrame() {
                  total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20,
                  sentenced >> 20, async_decodes.size(), decode_bytes >> 20,
                  (swizzle_data_buffer.capacity() + unswizzle_data_buffer.capacity()) >> 20);
+        {
+            // What the collector could take: images unused for 2 and for 10 frames, by kind
+            // (overlapped ones go without a download, GPU-written ones are downloaded first).
+            u64 unused[2][3]{};
+            for (size_t i = 0; i < 2; ++i) {
+                const u64 age = i == 0 ? 2 : 10;
+                if (frame_tick <= age) {
+                    continue;
+                }
+                lru_cache.ForEachItemBelow(frame_tick - age, [&](ImageId image_id) {
+                    const auto& image = slot_images[image_id];
+                    const u64 bytes = GetScaledImageSizeBytes(image);
+                    unused[i][True(image.flags & ImageFlagBits::BadOverlap)    ? 0
+                              : True(image.flags & ImageFlagBits::GpuModified) ? 1
+                                                                               : 2] += bytes;
+                    return false;
+                });
+            }
+            LOG_INFO(HW_GPU,
+                     "Memory trace: unused 2 frames: {} MiB overlapped, {} MiB GPU-written, {} MiB "
+                     "other; unused 10 frames: {} MiB overlapped, {} MiB GPU-written, {} MiB other",
+                     unused[0][0] >> 20, unused[0][1] >> 20, unused[0][2] >> 20, unused[1][0] >> 20,
+                     unused[1][1] >> 20, unused[1][2] >> 20);
+        }
+        if constexpr (requires { runtime.MemoryPressureEvents(); runtime.FailedImages(); }) {
+            LOG_INFO(HW_GPU,
+                     "Memory trace: {} allocations over budget, {} images not made; margins: out of "
+                     "memory {} MiB, block slack {} MiB; retention limit {} MiB",
+                     runtime.MemoryPressureEvents(), runtime.FailedImages(), pressure_margin >> 20,
+                     slack_margin >> 20, retention_limit >> 20);
+        }
         if constexpr (requires { runtime.LogMemoryTrace(); }) {
             runtime.LogMemoryTrace();
         }
@@ -637,8 +671,19 @@ void TextureCache<P>::TickFrame() {
         std::vector<std::pair<u32, u64>> shapes;
         for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
         std::sort(shapes.rbegin(), shapes.rend());
-        for (size_t i = 0; i < std::min<size_t>(10, shapes.size()); ++i) {
+        static const bool log_shapes = std::getenv("EDEN_NX2_TC_SHAPES") != nullptr;
+        if (log_shapes) {
+            LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} shapes made", shapes.size());
+        }
+        for (size_t i = 0; i < std::min<size_t>(log_shapes ? 24 : 10, shapes.size()); ++i) {
             const u64 key = shapes[i].second;
+            if (log_shapes) {
+                LOG_INFO(HW_GPU, "  created {}x: format {} type {} levels {} layers {} {}x{} (last at {:#x})",
+                         shapes[i].first, key >> 56, (key >> 52) & 0xF, (key >> 48) & 0xF,
+                         (key >> 36) & 0xFFF, (key >> 18) & 0x3FFFF, key & 0x3FFFF,
+                         created_shapes[key].second);
+                continue;
+            }
             LOG_DEBUG(HW_GPU, "  created {}x: format {} type {} levels {} layers {} {}x{} (last at {:#x})",
                      shapes[i].first, key >> 56, (key >> 52) & 0xF, (key >> 48) & 0xF,
                      (key >> 36) & 0xFFF, (key >> 18) & 0x3FFFF, key & 0x3FFFF,
@@ -646,7 +691,8 @@ void TextureCache<P>::TickFrame() {
         }
         created_shapes.clear();
         // The per-image and per-shape tallies only feed debug lines: skip them while those are off.
-        debug_stats = Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
+        debug_stats = log_shapes ||
+                      Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }
@@ -2333,8 +2379,62 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
+    // An image from the texture store is filled from its file: no staging buffer for the guest's
+    // bytes and no decode. From PS5_Lichii (mihawk, codeberg.org/mihawk/PS5_Lichii),
+    // src/video_core/texture_cache/texture_cache.h.
+    bool stored = false;
+    if constexpr (requires { runtime.UploadStoredAstc(image); }) {
+        if (image.info.astc_store_key != 0) {
+            stored = true;
+            bool known = true;
+            if (image.astc_store_loaded) {
+                // Uploaded before, so the guest has written its memory (or a page it shares)
+                // since the key was taken. Lichii uploads the same file again, which shows the old
+                // texture when a streaming game put another one of the same shape there. The bytes
+                // are hashed again: the file of the new ones is uploaded, and while the store has
+                // none (data still arriving, or a store that lacks the texture) the image keeps
+                // what it shows, as it cannot hold anything but BC7.
+                Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead>
+                    guest_data(*gpu_memory, image.gpu_addr, image.guest_size_bytes,
+                               &astc_scan_buffer);
+                const u64 key = runtime.FindStoredAstc(
+                    std::span<const u8>{guest_data.data(), guest_data.size()}, image.info);
+                known = key != 0;
+                if (known) {
+                    image.info.astc_store_key = key;
+                } else {
+                    static u64 unknown{};
+                    if (const u64 count = ++unknown; (count & (count - 1)) == 0) {
+                        LOG_WARNING(HW_GPU,
+                                    "Stored ASTC image {:#x} ({}x{}x{}) was rewritten with bytes "
+                                    "the texture store does not have; it keeps its old texture "
+                                    "({} such uploads so far)",
+                                    image.gpu_addr, image.info.size.width, image.info.size.height,
+                                    image.info.resources.layers, count);
+                    }
+                }
+            }
+            if (known) {
+                if (runtime.UploadStoredAstc(image)) {
+                    image.astc_store_loaded = true;
+                } else {
+                    static u32 logged{};
+                    if (logged++ < 32) {
+                        LOG_ERROR(HW_GPU,
+                                  "The texture store's {:016x} could not be uploaded to its "
+                                  "{}x{}x{} image at {:#x}",
+                                  image.info.astc_store_key, image.info.size.width,
+                                  image.info.size.height, image.info.resources.layers,
+                                  image.gpu_addr);
+                    }
+                }
+            }
+            // Whatever happened above, the image is in the layout its views are bound in.
+            runtime.TransitionImageLayout(image);
+        }
+    }
     if constexpr (std::is_same_v<Runtime, Vulkan::TextureCacheRuntime>) {
-        if (image.info.type == ImageType::e2D && image.info.resources.layers > 1 && image.guest_size_bytes >= LayerUploadMinSize && True(image.flags & ImageFlagBits::Converted) &&
+        if (!stored && image.info.type == ImageType::e2D && image.info.resources.layers > 1 && image.guest_size_bytes >= LayerUploadMinSize && True(image.flags & ImageFlagBits::Converted) &&
             False(image.flags & (ImageFlagBits::AcceleratedUpload | ImageFlagBits::Sparse |
                                  ImageFlagBits::Remapped | ImageFlagBits::Unbacked |
                                  ImageFlagBits::TrimmedLevels))) {
@@ -2364,7 +2464,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
             return;
         }
     }
-    if (!UploadInChunks(image)) {
+    if (stored) {
+        runtime.InsertUploadMemoryBarrier();
+    } else if (!UploadInChunks(image)) {
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
@@ -3336,7 +3438,18 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 // buffer) when the range is split.
                 Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead>
                     scan_data(*gpu_memory, gpu_addr, scan_bytes, &astc_scan_buffer);
+                // The texture store first: its images are BC7 either way, and the hash is faster
+                // than the scan for opaque blocks. Without a store the runtime answers 0 at once.
+                // From PS5_Lichii (mihawk, codeberg.org/mihawk/PS5_Lichii),
+                // src/video_core/texture_cache/texture_cache.h.
+                if constexpr (requires {
+                                  runtime.FindStoredAstc(std::span<const u8>{}, new_info);
+                              }) {
+                    new_info.astc_store_key = runtime.FindStoredAstc(
+                        std::span<const u8>{scan_data.data(), scan_data.size()}, new_info);
+                }
                 new_info.astc_opaque =
+                    new_info.astc_store_key == 0 &&
                     AstcDataLooksOpaque(std::span<const u8>{scan_data.data(), scan_data.size()});
                 ++(new_info.astc_opaque ? astc_opaque_images : astc_alpha_images);
             }
@@ -3816,7 +3929,9 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     } while (has_deleted_images);
     has_deleted_images = delete_state;
     if (!image_id) {
-        return NULL_IMAGE_VIEW_ID;
+        // No attachment rather than the null view: it has no render target view, and a
+        // framebuffer made with it hands the driver a null handle (AMD: access violation).
+        return ImageViewId{};
     }
     Image& image = slot_images[image_id];
     const ImageViewType view_type = RenderTargetImageViewType(info);
@@ -4592,9 +4707,11 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
         True(src.flags & ImageFlagBits::UnwrittenSparse)) {
         return;
     }
-    if (dst.info.astc_opaque != src.info.astc_opaque) {
-        // BC1 and BC3 blocks differ in size, so the host can't copy between them; both hold the
-        // same guest data, which is uploaded from guest memory instead.
+    if (dst.info.astc_opaque != src.info.astc_opaque ||
+        (dst.info.astc_store_key != 0) != (src.info.astc_store_key != 0)) {
+        // BC1 and BC3 blocks differ in size, so the host can't copy between them, and a stored
+        // BC7 image's blocks mean nothing in BC3; both hold the same guest data, which is
+        // uploaded from guest memory (or the store) instead.
         return;
     }
     // As in BlitImage: land a parked deferred clear before the copy overwrites the image.

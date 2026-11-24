@@ -48,6 +48,9 @@
 #include "video_core/pending_maps.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_timestamp.h"
+#if defined(__PROSPERO__) // PS5
+#include "performance.h" // gpu_clock_divisor
+#endif // PS5
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
@@ -285,6 +288,16 @@ struct GPU::Impl {
     }
 
     [[nodiscard]] u64 GetTicks() const {
+#if defined(__PROSPERO__) // PS5
+        // The port's own divisor for a Switch 2 game (performance.h, gpu_clock_divisor): as
+        // ReadGpuTimestamp shrinks the time since the last present for boost and overclock, further.
+        if (const u64 divisor = ::Eden::Performance::gpu_clock_divisor.load(std::memory_order_relaxed);
+            divisor != 0 && g_nx2_ampere.load(std::memory_order_relaxed)) {
+            const u64 now = static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count());
+            const u64 present_ns = ampere_anchor.load(std::memory_order_relaxed).PresentNs();
+            return present_ns == 0 || now <= present_ns ? now : present_ns + (now - present_ns) / divisor;
+        }
+#endif // PS5
         return ReadGpuTimestamp(system.CoreTiming(), g_nx2_ampere.load(std::memory_order_relaxed),
                                 Settings::values.gpu_clock.GetValue(),
                                 ampere_anchor.load(std::memory_order_relaxed));

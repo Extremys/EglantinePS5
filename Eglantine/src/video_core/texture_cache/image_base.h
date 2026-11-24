@@ -118,6 +118,9 @@ struct ImageBase {
     std::vector<std::pair<u64, u64>> dirty_ranges;
     u64 scale_tick = 0;
     bool has_scaled = false;
+    /// The texture store's file (ImageInfo::astc_store_key) was uploaded once: a later upload
+    /// first checks that the guest's bytes are still the ones the key was taken from.
+    bool astc_store_loaded = false;
 
     /// The channel and GPU address space whose page table RegisterImage put the image in.
     size_t channel = 0;

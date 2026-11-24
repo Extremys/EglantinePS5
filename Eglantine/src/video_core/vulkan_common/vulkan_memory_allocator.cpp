@@ -4,10 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <chrono>
-#include <thread>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <cstdio>
 #include <array>
 #include <bit>
@@ -51,42 +51,8 @@ extern "C" std::size_t eden_heap_committed(void);
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
 
-// The guest memory service (PS5 port) gives memory back on demand: it trims the driver's unused
-// blocks, then packs guest memory the game has not written for a while. Absent elsewhere. Returns
-// the bytes it gave back. (Old core patch 0023, lost in the move to the in-repo core.)
-extern "C" [[gnu::weak]] std::size_t eden_memory_recover(std::size_t bytes) noexcept;
-
 namespace Vulkan {
 namespace {
-// Out of device memory: asks for memory back (`bytes` and a 64 MiB block more) and tries again, up
-// to three times. The pool the console shares with the guest's memory fills with cold guest
-// memory that can be packed; without this the first failure skipped an image or ended the app.
-template <typename Create>
-VkResult RecoverDeviceMemory(VkResult result, VkDeviceSize bytes, Create&& create) {
-    for (int attempt = 0; result == VK_ERROR_OUT_OF_DEVICE_MEMORY && attempt < 3; ++attempt) {
-        if (&eden_memory_recover == nullptr ||
-            eden_memory_recover(static_cast<std::size_t>(bytes) + (std::size_t{64} << 20)) == 0) {
-            break;
-        }
-        result = create();
-    }
-    // Still refused. The driver keeps memory nothing is bound to for two seconds before it gives
-    // it back (commands recorded earlier may still use it), and the caches answer the pressure
-    // over the next frames: wait for both in short steps rather than end the session. Ocarina of
-    // Time ended with VK_ERROR_OUT_OF_DEVICE_MEMORY at an area change after 12 minutes in Kokiri
-    // Forest with 252 MiB in that quarantine.
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && &eden_memory_recover != nullptr) {
-        int waits = 0;
-        for (; result == VK_ERROR_OUT_OF_DEVICE_MEMORY && waits < 12; ++waits) {
-            std::this_thread::sleep_for(std::chrono::milliseconds{250});
-            (void)eden_memory_recover(static_cast<std::size_t>(bytes) + (std::size_t{64} << 20));
-            result = create();
-        }
-        LOG_WARNING(Render_Vulkan, "Device memory for {} MiB {} after waiting {} ms for memory back",
-                    bytes >> 20, result == VK_SUCCESS ? "found" : "still refused", waits * 250);
-    }
-    return result;
-}
 
 // Helpers translating MemoryUsage to flags/usage
 
@@ -295,6 +261,54 @@ MemoryAllocator::~MemoryAllocator() {
     for (auto pool : temporary_pools) if (pool) vmaDestroyPool(allocator, pool);
 }
 
+#if defined(__PROSPERO__) // PS5
+} // namespace Vulkan
+// The guest memory service gives memory back to the pool (src/guest_memory_service.inc): cold guest
+// memory is packed, or goes to the swap store.
+extern "C" [[gnu::weak]] std::size_t eden_memory_recover(std::size_t bytes) noexcept;
+namespace Vulkan {
+namespace {
+// Out of device memory on the console, where the guest, the heap and the driver share one pool:
+// the driver asked for memory back once and tried once more, and what came back had gone to
+// another taker (a guest write, the heap) by then; the failed allocation ended the session. So
+// memory is asked back and the allocation tried again before it counts as failed. The service
+// only gives up memory nothing has touched for a while, and finds more of it every second or two,
+// so a try that failed waits before the next: 50 ms when nothing came back, 10 ms when less than
+// was asked did.
+// For 4 s by the clock, then the allocation fails as before. It used to be 40 tries, which waited
+// only when nothing came back: 41 minutes into a Mario Kart World session each request brought
+// 2 MiB (what the try before it had left behind), 32 tries were gone in 20 ms and the rest in
+// 0.4 s, the render target they were for went without memory and the session ended; the images
+// before it at the same load had theirs after up to 18 tries.
+// And for 8 requests that brought all they asked for: an allocation that still fails then does not
+// fail for want of memory in the pool, and asking on would only empty the guest's.
+template <typename Allocate>
+VkResult RetryAfterRecovery(VkResult result, u64 bytes, Allocate&& allocate) {
+    static std::atomic<u32> logged{}, given_up{};
+    const auto start = std::chrono::steady_clock::now();
+    int granted = 0;
+    for (int attempt = 0; result == VK_ERROR_OUT_OF_DEVICE_MEMORY && &eden_memory_recover != nullptr; ++attempt) {
+        const u64 want = std::clamp<u64>(bytes, u64{16} << 20, u64{128} << 20) + (u64{16} << 20);
+        const std::size_t back = eden_memory_recover(static_cast<std::size_t>(want));
+        result = allocate();
+        const bool last = std::chrono::steady_clock::now() - start >= std::chrono::seconds(4) ||
+                          (back >= want && ++granted == 8);
+        // (The tries that gave up have a count of their own: the others must not use up their lines.)
+        const bool gave_up = last && result == VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        if (gave_up ? given_up.fetch_add(1, std::memory_order_relaxed) < 32
+                    : (result == VK_SUCCESS || attempt % 20 == 19) && logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+            LOG_WARNING(Render_Vulkan, "Out of device memory: asked {} MiB back, got {} MiB, attempt {} {}",
+                        want >> 20, back >> 20, attempt + 1,
+                        result == VK_SUCCESS ? "succeeded" : gave_up ? "failed, the last one" : "failed");
+        }
+        if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY || last) break;
+        if (back < want) std::this_thread::sleep_for(std::chrono::milliseconds(back == 0 ? 50 : 10));
+    }
+    return result;
+}
+} // namespace
+#endif // PS5
+
 vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
 {
     vk::Image image;
@@ -351,10 +365,11 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         VmaAllocationCreateInfo relaxed = alloc_ci;
         relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
         result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
-        // The request is not known before a failure: 8 bytes a texel covers every format used.
-        result = RecoverDeviceMemory(result, texels * 8, [&] {
+#if defined(__PROSPERO__) // PS5
+        result = RetryAfterRecovery(result, texels * 4, [&] {
             return vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
         });
+#endif // PS5
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Still out of device memory: a real image in host memory (slow, but valid) beats one
@@ -592,9 +607,11 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
             VmaAllocationCreateInfo relaxed = alloc_ci;
             relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
             result = vmaCreateBuffer(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
-            result = RecoverDeviceMemory(result, ci.size, [&] {
+#if defined(__PROSPERO__) // PS5
+            result = RetryAfterRecovery(result, ci.size, [&] {
                 return vmaCreateBuffer(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
             });
+#endif // PS5
         }
         vk::Check(result);
     }
@@ -732,8 +749,11 @@ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsa
             ci3.preferredFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
             res = vmaAllocateMemory(allocator, &reqs, &ci3, &a, &info);
         }
-        res = RecoverDeviceMemory(res, reqs.size,
-                                  [&] { return vmaAllocateMemory(allocator, &reqs, &ci2, &a, &info); });
+#if defined(__PROSPERO__) // PS5
+        // (Ours, 5863e62: upstream only retries images and buffers.)
+        res = RetryAfterRecovery(res, reqs.size,
+                                 [&] { return vmaAllocateMemory(allocator, &reqs, &ci2, &a, &info); });
+#endif // PS5
     }
 
     vk::Check(res);
@@ -771,10 +791,13 @@ MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage
             ci3.preferredFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
             res = vmaAllocateMemoryForBuffer(allocator, raw, &ci3, &a, &info);
         }
+#if defined(__PROSPERO__) // PS5
+        // (Ours, 5863e62: upstream only retries images and buffers.)
         const VkMemoryRequirements requirements = device.GetLogical().GetBufferMemoryRequirements(raw);
-        res = RecoverDeviceMemory(res, requirements.size, [&] {
+        res = RetryAfterRecovery(res, requirements.size, [&] {
             return vmaAllocateMemoryForBuffer(allocator, raw, &ci2, &a, &info);
         });
+#endif // PS5
     }
 
     vk::Check(res);

@@ -601,6 +601,15 @@ int main(int argc, char** argv) {
                                           std::pair{"EDEN_PS5_WORKER_SPIN_US", "300"}}) {
             setenv(name, value, 0);
         }
+        // The guest memory service's swap store (src/guest_memory_service.inc, "Swap"): store.bin and
+        // index.bin in the data folder's cache/swap, kept between sessions, so only with storage
+        // access. They are opened when a game first runs short of memory.
+        if (Eden::FilesystemAccess()) {
+            (void)mkdir((std::string{Eden::kDataDir} + "/cache").c_str(), 0777);
+            setenv("EDEN_SWAP_DIR", (std::string{Eden::kDataDir} + "/cache/swap").c_str(), 0);
+            // "performance": { "swap_file": false } in the settings file switches it off.
+            if (!Eden::LoadSwapFile()) setenv("EDEN_SWAP", "0", 0);
+        }
         // The 64-bit fastmem window (src/host_memory.cpp, Window64): opt-in while it is qualified,
         // EDEN_FASTMEM64=1. Chosen here, before Core::System (and so HostMemory) is made.
         if (const char* window64 = std::getenv("EDEN_FASTMEM64")) Eden::Fastmem::RequestA64(window64[0] == '1');
@@ -922,6 +931,7 @@ int main(int argc, char** argv) {
         [[maybe_unused]] bool dev_block_list = false;  // read where a session applies its settings
         [[maybe_unused]] bool dev_astc_cpu = false;   // dev-settings astc=cpu
         [[maybe_unused]] bool dev_astc_full = false;  // dev-settings astc_textures=full
+        [[maybe_unused]] bool dev_gpu_clock = false;  // dev-settings gpu_clock=...: the settings do not change it
 #ifdef EDEN_DEV_PROFILE
         // One-run A/B switches written by the development runner; absent = defaults.
         {
@@ -1099,6 +1109,7 @@ int main(int argc, char** argv) {
                     // Guest-visible GPU timestamp scale (Eden's fast_gpu_time; Boost is the default).
                     Settings::values.gpu_clock.SetValue(entry.ends_with("normal") ? Settings::GpuClock::Normal :
                         entry.ends_with("boost") ? Settings::GpuClock::Boost : Settings::GpuClock::Overclock);
+                    dev_gpu_clock = true;
                 } else if (entry.starts_with("rom=")) {
                     // Development title override, applied when the title is selected.
                 } else if (entry == "fs_callers=on") {
@@ -1331,11 +1342,6 @@ int main(int argc, char** argv) {
                     setenv("EDEN_NX2_TC_EXPECTED_MIB", "2048", 0);
                     setenv("EDEN_NX2_TC_CRITICAL_MIB", "2560", 0);
                     setenv("EDEN_CRAM_PACK_BELOW_MIB", "12288", 0); // pack from the start
-                    // Slots the GPU's caches map are split into 64 KiB units like the rest: they hold 3.2 GB of
-                    // the game's 4.1 GB, and kept whole they left the pool full after 12 to 16 minutes in Kokiri
-                    // Forest (VK_ERROR_OUT_OF_DEVICE_MEMORY). Split, the game holds 2.9 to 3.0 GB and a 25-minute
-                    // session had no allocation refused. EDEN_CRAM_SPLIT_GPU=0 keeps them whole.
-                    setenv("EDEN_CRAM_SPLIT_GPU", "1", 0);
                 } else if (fallback_ours && eden_game_title_id(guest) != 0x0400486024DEC000ULL) {
                     unsetenv("EDEN_NX2_FORCE_MESH_FALLBACK");
                     fallback_ours = false;
@@ -1353,6 +1359,21 @@ int main(int argc, char** argv) {
             }
             if (speed.unsafe_cpu) Settings::values.cpu_accuracy = Settings::CpuAccuracy::Unsafe;
             if (speed.unsafe_dma) Settings::values.dma_accuracy.SetValue(Settings::DmaAccuracy::Unsafe);
+            // How fast the GPU looks to the game (settings_store.h, LoadGpuClock; fixed for Mario
+            // Kart World). EDEN_GPU_CLOCK=normal|boost|overclock|fixed in env.txt goes before the settings.
+            {
+                std::string clock = dev_gpu_clock ? std::string{} : Eden::LoadGpuClock(eden_game_title_id(guest));
+                if (const char* const forced = std::getenv("EDEN_GPU_CLOCK")) clock = forced;
+                if (clock == "normal") Settings::values.gpu_clock.SetValue(Settings::GpuClock::Normal);
+                else if (clock == "boost") Settings::values.gpu_clock.SetValue(Settings::GpuClock::Boost);
+                else if (clock == "overclock" || clock == "fixed") Settings::values.gpu_clock.SetValue(Settings::GpuClock::Overclock);
+                Eden::Performance::gpu_clock_divisor.store(clock == "fixed" ? 256 : 0, std::memory_order_relaxed);
+                const auto set = Settings::values.gpu_clock.GetValue();
+                Eden::Report("launch", (std::string("GPU clock: ") +
+                                        (clock == "fixed" ? "fixed"
+                                         : set == Settings::GpuClock::Normal ? "normal"
+                                         : set == Settings::GpuClock::Overclock ? "overclock" : "boost")).c_str());
+            }
             Settings::values.use_reactive_flushing.SetValue(speed.reactive_flushing);
             Settings::values.skip_cpu_inner_invalidation.SetValue(speed.skip_invalidation);
             // The block list is off unless the settings turn it on (block-list.txt in the app

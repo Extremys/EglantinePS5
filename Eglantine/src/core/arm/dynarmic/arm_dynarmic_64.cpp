@@ -445,6 +445,35 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 #endif
 #else // PS5
     config.code_cache_size = std::uint32_t(m_cb->m_process->IsSwitch2() ? (m_core_index == 0 ? 160_MiB : m_core_index == 1 ? 144_MiB : m_core_index < 6 ? 96_MiB : 16_MiB) : (m_core_index == 0 ? 256_MiB : m_core_index < 3 ? 192_MiB : 128_MiB));
+    // A cache takes memory as code is written into it, 2 MiB at a time (src/memory_pages.cpp,
+    // "A range that fills"), so its size is only the most it may grow to. A Switch 2 title's
+    // cores get 320 MiB each; the figure and its switch are from PS5_Lichii (mihawk,
+    // codeberg.org/mihawk/PS5_Lichii), src/core/arm/dynarmic/arm_dynarmic_64.cpp. There a cache
+    // of 128 MiB filled every 40 s once Link moved in Ocarina of Time's field, with a full clear
+    // each time (16.6 fps, 327 frames over 100 ms in 220 s), and one of 320 MiB did not fill
+    // (21.9 fps, 106 such frames). Here the cores share their blocks, and one full cache clears
+    // them all. Six caches had to stay under 1 GiB together (the 688 MiB above) for a block in
+    // one to reach a block in any other with a 32-bit offset, as each cache's two views lay one
+    // after the other; the views that run now lie side by side, and six of 320 MiB are in reach.
+    // EDEN_PS5_CODE_CACHE_MIB=<n> (env.txt) is the size of every core's cache instead, for any
+    // 64-bit title, from 64 to 336: six larger ones do not fit that span of just under 2 GiB.
+    // EDEN_JIT_LAZY_CACHE=0 keeps the sizes above, and the memory behind them in 16 MiB steps.
+    {
+        static const bool by_piece = [] {
+            const char* const value = std::getenv("EDEN_JIT_LAZY_CACHE");
+            return value == nullptr || value[0] != '0';
+        }();
+        // (An even number of MiB: a cache is a whole number of 2 MiB pieces.)
+        static const u32 asked_mib = [] {
+            const char* const value = std::getenv("EDEN_PS5_CODE_CACHE_MIB");
+            return value != nullptr ? std::clamp<u32>(static_cast<u32>(std::atoi(value)), 64, 336) & ~1u : 0u;
+        }();
+        if (by_piece && asked_mib != 0) {
+            config.code_cache_size = asked_mib << 20;
+        } else if (by_piece && m_cb->m_process->IsSwitch2()) {
+            config.code_cache_size = std::uint32_t(320_MiB);
+        }
+    }
 #endif // PS5
 #endif
 
