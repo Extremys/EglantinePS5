@@ -1356,6 +1356,10 @@ int main(int argc, char** argv) {
                     // In 25-minute roams the frames of 0.5 to 1.2 s that came with each burst of writes
                     // after a failed allocation went (33.6 FPS mean, 1.3 GiB written).
                     setenv("EDEN_SWAP_KEEPER", "1", 0);
+                    // The keeper aims for 1 GiB free in 2 MiB pieces, not 512 MiB: with 512, 1 GiB of idle guest
+                    // memory stayed in place while late in a session allocations failed and waited for writes
+                    // (frames of 1.7 s); with 1024 a 25-minute roam had no failed allocation, worst frame 236 ms.
+                    setenv("EDEN_CRAM_KEEP_FREE_MIB", "1024", 0);
                 } else if (fallback_ours && eden_game_title_id(guest) != 0x0400486024DEC000ULL) {
                     unsetenv("EDEN_NX2_FORCE_MESH_FALLBACK");
                     fallback_ours = false;

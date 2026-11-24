@@ -4223,8 +4223,9 @@ namespace {
 std::atomic<std::size_t> pool_free_seen{0};
 std::atomic<std::uint64_t> pool_free_seen_ns{0};
 std::size_t KeepFreeMark() noexcept {
-    static const std::size_t bytes = EnvOr("EDEN_CRAM_KEEP_FREE_MIB", 512) << 20;
-    return bytes;
+    // (EglantinePS5) Read each time: per-title defaults are set once the game is known, after the
+    // keeper has started.
+    return EnvOr("EDEN_CRAM_KEEP_FREE_MIB", 512) << 20;
 }
 void KeepFree() noexcept {
 #ifdef PS5_NATIVE
@@ -4250,7 +4251,7 @@ void KeepFree() noexcept {
     // Packing in memory at once. To the swap store, when it may at all (EDEN_SWAP_KEEPER=1), only
     // when the pool has stayed under the mark for 3 s or has a quarter of it left: a race start
     // takes 2 GB and gives half of it back within seconds.
-    static const bool may_write = EnvOr("EDEN_SWAP_KEEPER", 0) != 0;
+    const bool may_write = EnvOr("EDEN_SWAP_KEEPER", 0) != 0; // (EglantinePS5) each time: per-title default
     const std::uint64_t now = SwapNow();
     if (below_since == 0) below_since = now;
     const bool write = may_write && (now - below_since >= 3'000'000'000ull || free_pieces < mark / 4);
