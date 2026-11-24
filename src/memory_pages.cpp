@@ -18,6 +18,8 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -320,23 +322,87 @@ extern "C" int eden_direct_low(std::size_t size, std::size_t alignment, int type
 #ifdef PS5_NATIVE
 std::int64_t zero_block = -1;
 
-// A 2 MiB block of direct memory, zeroed through a mapping of its own that is gone again.
-bool ZeroedBlock(std::int64_t* physical) {
-    if (eden_direct_low(SparseSlot, SparseSlot, 12, physical) != 0)
-        return false;
-    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
-    if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, *physical, SparseSlot) != 0) {
-        (void)sceKernelReleaseDirectMemory(*physical, SparseSlot);
-        return false;
-    }
-    std::memset(view, 0, SparseSlot);
-    if (munmap(view, SparseSlot) != 0) std::abort();
-    return true;
+// A mapping gives its address space back to a reservation in one call: the reservation goes
+// straight over it. Unmapped first and reserved after, the range is free in between, and a mapping
+// another thread asks for without a fixed address (a view the guest memory service unpacks or
+// zeroes a block through) can land in it; the reservation then takes that view away under its
+// writer. Mario Kart World ended that way at its second race load: a write fault in LZ4 inside
+// the fault handler, at a view that was no longer there, which the system answers by ending the
+// app with no report. 1: reserved; 0: unmapped but not reserved; -1: the mapping is still there.
+int ReserveOver(void* at, std::size_t size, std::size_t alignment) noexcept {
+    void* again = at;
+    if (sceKernelReserveVirtualRange(&again, size, MAP_FIXED, alignment) == 0 && again == at) return 1;
+    if (munmap(at, size) != 0) return -1;
+    again = at;
+    return sceKernelReserveVirtualRange(&again, size, MAP_FIXED, alignment) == 0 && again == at ? 1 : 0;
 }
 bool MapSlot(std::uintptr_t at, int protection, std::int64_t physical) {
     void* address = reinterpret_cast<void*>(at);
     return sceKernelMapDirectMemory(&address, SparseSlot, protection, MAP_FIXED, physical, SparseSlot) == 0 &&
            address == reinterpret_cast<void*>(at);
+}
+
+// Views: a block is zeroed, copied or unpacked through a second mapping of it, gone again after.
+// They have address space of their own, reserved once, and are mapped at fixed places in it: a view
+// mapped wherever the system has room can land in a range another thread has unmapped for a moment
+// and is about to map or reserve again (ReserveOver above closes this file's own such windows; the
+// driver and the system's libraries have theirs). A view is written from fault handlers, where a
+// second fault ends the app.
+constexpr std::size_t ViewSlots = 64;
+std::atomic<std::uintptr_t> view_base{0};
+std::atomic_flag view_taken[ViewSlots];
+void* MapView(std::int64_t physical, std::size_t bytes, int protection, std::size_t alignment) noexcept {
+    std::uintptr_t base = view_base.load(std::memory_order_acquire);
+    if (base == 0) {
+        void* address = reinterpret_cast<void*>(cpu_mapping_hint);
+        if (sceKernelReserveVirtualRange(&address, ViewSlots * SparseSlot, 0, SparseSlot) == 0) {
+            std::uintptr_t expected = 0;
+            if (!view_base.compare_exchange_strong(expected, reinterpret_cast<std::uintptr_t>(address), std::memory_order_acq_rel))
+                (void)munmap(address, ViewSlots * SparseSlot); // another thread's came first (address space only)
+        }
+        base = view_base.load(std::memory_order_acquire);
+    }
+    if (base == 0 || bytes > SparseSlot) {
+        // No address space of their own: wherever the system has room, as before.
+        void* view = reinterpret_cast<void*>(cpu_mapping_hint);
+        return sceKernelMapDirectMemory(&view, bytes, protection, 0, physical, alignment) == 0 ? view : nullptr;
+    }
+    for (;;) {
+        for (std::size_t i = 0; i < ViewSlots; ++i) {
+            if (view_taken[i].test_and_set(std::memory_order_acquire)) continue;
+            void* const want = reinterpret_cast<void*>(base + i * SparseSlot);
+            void* view = want;
+            if (sceKernelMapDirectMemory(&view, bytes, protection, MAP_FIXED, physical, alignment) == 0 && view == want) return view;
+            view_taken[i].clear(std::memory_order_release);
+            return nullptr;
+        }
+        sched_yield(); // every view is in use
+    }
+}
+void UnmapView(void* view, std::size_t bytes) noexcept {
+    const std::uintptr_t base = view_base.load(std::memory_order_acquire);
+    const auto at = reinterpret_cast<std::uintptr_t>(view);
+    if (base == 0 || at < base || at >= base + ViewSlots * SparseSlot) {
+        if (munmap(view, bytes) != 0) std::abort();
+        return;
+    }
+    // Its place stays reserved (never free for another mapping), then may be taken again.
+    if (ReserveOver(view, bytes, 0x4000) != 1) std::abort();
+    view_taken[(at - base) / SparseSlot].clear(std::memory_order_release);
+}
+
+// A 2 MiB block of direct memory, zeroed through a mapping of its own that is gone again.
+bool ZeroedBlock(std::int64_t* physical) {
+    if (eden_direct_low(SparseSlot, SparseSlot, 12, physical) != 0)
+        return false;
+    void* const view = MapView(*physical, SparseSlot, PROT_READ | PROT_WRITE, SparseSlot);
+    if (view == nullptr) {
+        (void)sceKernelReleaseDirectMemory(*physical, SparseSlot);
+        return false;
+    }
+    std::memset(view, 0, SparseSlot);
+    UnmapView(view, SparseSlot);
+    return true;
 }
 #endif
 
@@ -657,6 +723,46 @@ static void ReportSparseCommitFailure(const SparseRange& range, std::size_t slot
     Report(line);
 }
 
+} // namespace Common
+// The guest memory service gives memory back to the pool (guest_memory_service.inc; never waits
+// without end, so it may be asked with other locks held).
+extern "C" std::size_t eden_memory_recover_try(std::size_t bytes) noexcept;
+namespace Common {
+namespace {
+// A table's or the guest's next 2 MiB found the pool empty: memory is asked back and the commit
+// tried again, for up to 2 s, before it counts as failed. These commits were the one taker that
+// did not ask: 21 minutes into a Mario Kart World session a piece of the GPU's page tables found
+// 1 MiB free and ended the app, while the service had 1 GB of Idle slots to give and most of its
+// swap file's budget unused.
+template <typename Commit>
+bool CommitWithRecovery(Commit&& commit) noexcept {
+    // EDEN_SPARSE_COMMIT_TEST=N (a test of this path): the first try of every N-th commit counts
+    // as refused, so memory is asked back and the commit tried again with the pool as it is.
+    static const std::size_t test_every = [] {
+        const char* const value = std::getenv("EDEN_SPARSE_COMMIT_TEST");
+        return value != nullptr ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : std::size_t{0};
+    }();
+    static std::atomic<std::size_t> commits{0}, asked{0};
+    const bool refused = test_every != 0 && commits.fetch_add(1, std::memory_order_relaxed) % test_every == test_every - 1;
+    if (!refused && commit()) return true;
+    for (int tries = 0; tries < 100; ++tries) {
+        if (eden_memory_recover_try(8 * SparseSlot) == 0) {
+            const timespec pause{0, 20'000'000};
+            nanosleep(&pause, nullptr);
+        }
+        if (!commit()) continue;
+        // (Said the 1st, 2nd, 4th, 8th ... time.)
+        if (const std::size_t count = asked.fetch_add(1, std::memory_order_relaxed) + 1; (count & (count - 1)) == 0) {
+            char line[128];
+            const int length = std::snprintf(line, sizeof(line),
+                "EDEN_SPARSE_TABLES a commit found no memory and got it after asking (%zu so far, try %d)\n", count, tries + 1);
+            if (length > 0) Report(line);
+        }
+        return true;
+    }
+    return false;
+}
+} // namespace
 void CommitSparsePage(std::uintptr_t page) noexcept {
     SparseRange* range = SparseRangeOf(page);
     if (range == nullptr) return; // dense: already writable
@@ -665,23 +771,28 @@ void CommitSparsePage(std::uintptr_t page) noexcept {
     if (range->owned[slot].load(std::memory_order_acquire)) return;
     if (range->state != nullptr) {
         // A range with slot states commits under the slot's lock (guest_memory_service.inc).
-        if (!ServiceCommit(*range, slot)) {
+        if (!CommitWithRecovery([&]() noexcept { return ServiceCommit(*range, slot); })) {
             ReportSparseCommitFailure(*range, slot);
             Report("EDEN_SPARSE_TABLES commit failed: out of memory\n");
             std::abort();
         }
         return;
     }
-    const std::lock_guard lock{sparse_mutex};
-    if (range->owned[slot].load(std::memory_order_relaxed)) return;
-    if (!OwnSlot(begin + slot * SparseSlot, &range->physical[slot])) {
+    // (The lock is let go while memory is asked back.)
+    const bool committed = CommitWithRecovery([&]() noexcept {
+        const std::lock_guard lock{sparse_mutex};
+        if (range->owned[slot].load(std::memory_order_relaxed)) return true;
+        if (!OwnSlot(begin + slot * SparseSlot, &range->physical[slot])) return false;
+        (range->guest ? guest_committed : sparse_committed).fetch_add(SparseSlot, std::memory_order_relaxed);
+        range->owned[slot].store(true, std::memory_order_release);
+        return true;
+    });
+    if (!committed) {
         // Out of memory in the middle of a guest mapping: there is no table to continue with.
         ReportSparseCommitFailure(*range, slot);
         Report("EDEN_SPARSE_TABLES commit failed: out of memory\n");
         std::abort();
     }
-    (range->guest ? guest_committed : sparse_committed).fetch_add(SparseSlot, std::memory_order_relaxed);
-    range->owned[slot].store(true, std::memory_order_release);
 }
 
 // Eden gives back a table page once a guest unmapped all of it, and expects zeroes there
@@ -821,11 +932,7 @@ bool CommitMemoryRangeFrom(void* address, std::size_t size, bool high) noexcept 
         }
         if (!RecordCommitted(begin + done, block, physical)) {
             // No entry left to give it back with: unmap it now, keeping the address space.
-            if (munmap(at, block) == 0) {
-                void* again = at;
-                (void)sceKernelReserveVirtualRange(&again, block, MAP_FIXED, LargePage);
-                (void)sceKernelReleaseDirectMemory(physical, block);
-            }
+            if (ReserveOver(at, block, LargePage) >= 0) (void)sceKernelReleaseDirectMemory(physical, block);
             break;
         }
         done += block;
@@ -869,12 +976,12 @@ int DecommitMemoryRange(void* address, std::size_t size) noexcept {
         void* at = reinterpret_cast<void*>(block.address);
         // As the guest's memory gives a block back (src/host_memory.cpp): unmapped, the address
         // space reserved again at once, then the memory released.
-        if (munmap(at, block.size) != 0) {
+        const int reserved = ReserveOver(at, block.size, LargePage);
+        if (reserved < 0) {
             result = -1;
             continue;
         }
-        void* again = at;
-        if (sceKernelReserveVirtualRange(&again, block.size, MAP_FIXED, LargePage) != 0 || again != at) result = -1;
+        if (reserved == 0) result = -1;
         if (sceKernelReleaseDirectMemory(block.physical, block.size) != 0) result = -1;
         covered += block.size;
         block = CommittedBlock{};
@@ -926,12 +1033,12 @@ int PageOutRange(void* address, std::size_t size) noexcept {
     }
     const std::int64_t physical = owner->physical + static_cast<std::int64_t>(left);
     void* at = address;
-    if (munmap(at, size) != 0) {
+    const int reserved_over = ReserveOver(at, size, SmallPage);
+    if (reserved_over < 0) {
         UnlockCommitted();
         return 0;
     }
-    void* again = at;
-    const bool reserved = sceKernelReserveVirtualRange(&again, size, MAP_FIXED, SmallPage) == 0 && again == at;
+    const bool reserved = reserved_over == 1;
     if (!reserved || sceKernelReleaseDirectMemory(physical, size) != 0) {
         // The system kept the memory: map it back where it was, as it was.
         void* back = at;
@@ -967,11 +1074,7 @@ int PageInRange(void* address, std::size_t size) noexcept {
         return 0;
     }
     if (!RecordCommitted(begin, size, physical)) {
-        if (munmap(at, size) == 0) {
-            void* again = at;
-            (void)sceKernelReserveVirtualRange(&again, size, MAP_FIXED, SmallPage);
-            (void)sceKernelReleaseDirectMemory(physical, size);
-        }
+        if (ReserveOver(at, size, SmallPage) >= 0) (void)sceKernelReleaseDirectMemory(physical, size);
         return 0;
     }
     return 1;
