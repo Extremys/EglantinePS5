@@ -63,6 +63,9 @@ Counters counters;
 constexpr unsigned AliasesPerSlot = 4;
 constexpr std::uintptr_t AliasReadOnly = 1, AliasSmall = 2, AliasFlags = AliasReadOnly | AliasSmall;
 std::atomic<std::uint64_t> aliases_made{0}, aliases_dropped{0}, aliases_refused{0};
+// The window asked for a slot or a page at least once (EDEN_FASTMEM64=1): a slot in 64 KiB units
+// then comes back whole at a touch, as the window can only show whole blocks ("Units" below).
+std::atomic<bool> window_seen{false};
 // The window region at `at` shows nothing again: a reservation straight over the mapping.
 void VoidWindowRegion([[maybe_unused]] std::uintptr_t at) noexcept {
 #ifdef PS5_NATIVE
@@ -191,6 +194,8 @@ struct PackedSlot {
     std::uint32_t size = 0;     // bytes in the packed store
     std::uint32_t swap = 0;     // not 0: the swap store has the slot's bytes (its units' slots are in swap_units)
     std::uint64_t hash = 0;     // swap store only: FullHash of the slot's 2 MiB, checked when read back
+    bool units = false;         // the slot is in 64 KiB units ("Units"): data is its packed units' piece, and
+                                // swap_units says where each unit is
 };
 std::atomic<PackedSlot*> packed_slots{nullptr}; // per slot of the guest's range, made by the scanner
 // Diagnostic (EDEN_CRAM_PACK_KEEP=1): a packed slot keeps its block, and the unpack compares what it
@@ -646,6 +651,14 @@ bool swap_refused = false;
 // How a slot may go to the store: only if that writes nothing (all of it is there already); with
 // writes while the budget keeps its part for failed allocations; with writes down to its last byte.
 enum class SwapWrites { None, Budget, Urgent };
+// Slots in 64 KiB units ("Units", further down; the host's check below uses these): what a unit's
+// record in swap_units says besides a slot of the store + 1.
+constexpr std::uint32_t UnitZero = SwapZeroUnit, UnitHere = 0x40000000u, UnitPacked = 0x80000000u, UnitIndex = 0x3FFFFFFFu;
+constexpr std::size_t UnitPackMax = SwapUnit * 3 / 4; // (Lichii's: 48 of 64 KiB)
+bool UnitZstdStart() noexcept;
+std::size_t UnitsOut(const std::uint8_t* bytes, std::uint32_t mask, std::uint32_t* units, std::uint16_t* sizes,
+                     std::uint8_t* packed, std::size_t used, SwapWrites writes, bool* wrote) noexcept;
+bool UnitFill(std::uint8_t* to, std::uint32_t record, std::uint16_t size, const std::uint8_t* piece) noexcept;
 // The 2 MiB at `at` (readable, and written by no one meanwhile) into the store: `units` gets the
 // slot + 1 of each of its 64 KiB, SwapZeroUnit for those of zeroes. False when the slot stays as
 // it is: it needs writes that `writes`, the budget or the store's room do not allow, or one failed
@@ -756,9 +769,14 @@ bool SwapReadSlot(void* view, const std::uint32_t* units, std::uint64_t hash) no
 std::uint32_t* swap_units = nullptr;
 
 // Forgets a slot's packed data, in the packed store or in the swap store (the slot is locked).
+void UnitForget(std::size_t slot) noexcept;
 void ForgetPacked(std::size_t slot) noexcept {
     PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
     if (table == nullptr) return;
+    if (table[slot].units) {
+        UnitForget(slot);
+        return;
+    }
     if (table[slot].swap != 0) { // (its units stay where they are: the store is found by contents)
         swap_slots.fetch_sub(1, std::memory_order_relaxed);
     } else if (table[slot].data != nullptr) {
@@ -967,6 +985,38 @@ extern "C" int eden_swap_check(const char* folder) noexcept {
            swap_appends.load() == appends_before + 1 && again[3] == count_before + 1 && again[12] == count_before + 2 &&
            again[25] == count_before + 3 && again[4] == units[4]);                                // 62
     expect(SwapReadSlot(back.data(), again, FullHash(at, SparseSlot)) && std::memcmp(slot.data(), back.data(), SparseSlot) == 0); // 63
+    // A slot in units ("Units", below): zeroes keep nothing, what zstd brings to three quarters stays
+    // in memory, what the store holds is found there, and the rest stays unless a write is allowed.
+    // Every unit comes back as it went. (Only where zstd is linked in.)
+    if (UnitZstdStart()) {
+        std::vector<std::uint8_t> mixed(SparseSlot), packed(SparseSlot), unit(SwapUnit);
+        for (std::uint8_t& byte : mixed) byte = static_cast<std::uint8_t>((seed = seed * 6364136223846793005ull + 1442695040888963407ull) >> 56);
+        std::memset(mixed.data(), 0, SwapUnit);                                   // unit 0: zeroes
+        for (std::size_t i = 0; i < SwapUnit; ++i) mixed[2 * SwapUnit + i] = static_cast<std::uint8_t>(i / 64); // unit 2: packs
+        std::memcpy(mixed.data() + 3 * SwapUnit, slot.data() + 20 * SwapUnit, SwapUnit); // unit 3: the store has it
+        std::uint16_t sizes[SwapUnits];
+        bool wrote = false;
+        const std::uint32_t held = swap_count;
+        std::size_t used = UnitsOut(mixed.data(), 0xFFFFFFFFu, units, sizes, packed.data(), 0, SwapWrites::None, &wrote);
+        bool stays = true;
+        for (std::size_t i = 4; i < SwapUnits; ++i) stays = stays && units[i] == 0;
+        expect(units[0] == UnitZero && units[2] != UnitZero && (units[2] & UnitPacked) && sizes[2] == used && used != 0 &&
+               used <= UnitPackMax && units[3] == again[20] && units[1] == 0 && stays && !wrote && swap_count == held); // 64
+        used = UnitsOut(mixed.data(), 0xFFFFFFFFu, units, sizes, packed.data(), 0, SwapWrites::Urgent, &wrote);
+        bool same = wrote && swap_count == held + 29 && units[1] == held + 1 && units[31] == held + 29;
+        for (std::size_t i = 0; i < SwapUnits && same; ++i)
+            same = UnitFill(unit.data(), units[i], sizes[i], packed.data()) &&
+                   std::memcmp(unit.data(), mixed.data() + i * SwapUnit, SwapUnit) == 0;
+        expect(same);                                                                             // 65
+        // A unit that is not what its record says is refused: a packed one cut short, one of the store changed.
+        expect(!UnitFill(unit.data(), units[2], static_cast<std::uint16_t>(sizes[2] - 1), packed.data()) &&
+               !UnitFill(unit.data(), UnitHere | 5, 0, packed.data()));                           // 66
+        const std::uint8_t flipped = static_cast<std::uint8_t>(~mixed[SwapUnit + 9]);
+        expect(pwrite(swap_store_fd, &flipped, 1, static_cast<off_t>(std::uint64_t{units[1] - 1} * SwapUnit + 9)) == 1 &&
+               !UnitFill(unit.data(), units[1], 0, packed.data()));                               // 67
+    } else {
+        for (int skipped = 0; skipped < 4; ++skipped) expect(true);                               // 64-67
+    }
     unlink(mark);
     SwapCheckReset();
     unlink(store);
@@ -1220,6 +1270,406 @@ int UnshareBlock(std::int64_t physical) noexcept {
     return left;
 }
 
+// ---- Units: a packed slot in 64 KiB units ----
+// After PS5_Lichii's guest memory (mihawk, codeberg.org/mihawk/PS5_Lichii, src/common/host_memory.cpp:
+// Ps5TrimZeroUnits, Ps5CommitOnTouch), which keeps all of the guest's memory in 64 KiB units, packs
+// the cold ones with zstd, sends those that will not pack to the swap store, and brings one unit
+// back at a touch. Here memory in use stays in 2 MiB blocks: the driver takes the pool in 2 MiB
+// pieces, and a slot in use is one mapping. It is the slot nothing touches that goes in units:
+//   - a unit of zeroes keeps nothing;
+//   - a unit zstd brings to UnitPackMax or less stays in memory, in the slot's piece of the packed store;
+//   - a unit whose bytes the swap store holds, or may be given (a request after a failed
+//     allocation; EDEN_SWAP_PASS=2), is there;
+//   - a unit that could only go with a write nobody asked for stays, in a unit of memory of its own.
+// Such a slot is Packed and has no block, and its address space is a reservation. A touch brings
+// back the unit touched and no other: 64 KiB of memory and one read, where a slot packed whole
+// took 2 MiB and 32. That is what a touch costs in Lichii, and why its pass can send memory ahead
+// of need: here the same pass ended Mario Kart World sessions while a touch brought 2 MiB back.
+//
+// Units of memory come from slabs, 2 MiB blocks of the pool cut in 32, so that what units give
+// back returns to the pool in pieces the driver can take. A slab keeps a view of its own; units are
+// filled and read through it. A unit with memory is mapped at its address (awake), or not mapped at
+// all (idle): taking access away is one reservation over the whole slot, giving it back one mapping
+// (Lichii's docs/ps5/kernel-calls.md: a map costs 2 us, a protection change 26 to 43). Units still
+// idle after IdleSeconds go the way the slot's others went. A slot whose 32 units all have memory
+// again is made whole (Own).
+//
+// With the 64-bit fastmem window (range.aliases) a touch brings the whole slot back, as before: the
+// window shows a slot's block, and a slot in units has none.
+// EDEN_CRAM_UNITS=0: slots are packed whole, as before (LZ4, or all of the slot in the swap store).
+// A slot goes in units when that gives back this much; less, with units that stay, is not worth a
+// slot in pieces.
+constexpr std::size_t UnitMinGain = std::size_t{512} << 10;
+struct UnitSlot {
+    std::uint32_t here = 0;       // units with memory of their own (a slab unit; swap_units has which)
+    std::uint32_t idle = 0;       // of those: not mapped now
+    std::uint32_t idle_since = 0; // when its units were last made idle (ColdNow)
+    std::uint32_t dead = 0;       // bytes of the slot's packed piece whose units came back
+};
+UnitSlot* unit_slots = nullptr;       // per slot (made with the packed table; the slot's lock)
+std::uint16_t* unit_bytes = nullptr;  // per unit: its bytes in the slot's packed piece
+std::uint8_t* unit_poor = nullptr;    // per slot: little of it would go without a write (until it is written)
+std::atomic<std::uint64_t> unit_slots_made{0}, unit_backs{0}, unit_zero_reads{0}, unit_woken{0}, unit_evicted{0};
+std::atomic<std::uint64_t> unit_moved{0}, unit_whole{0}, unit_packed{0}, unit_stayed{0}, unit_back_ns{0};
+
+bool UnitsWanted() noexcept {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_CRAM_UNITS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on && &ZSTD_createCCtx != nullptr && &ZSTD_createDCtx != nullptr && &ZSTD_compressCCtx != nullptr &&
+           &ZSTD_decompressDCtx != nullptr && &ZSTD_isError != nullptr;
+}
+// One context to pack with (pack_mutex), eight to unpack with (fault handlers, which must not
+// allocate: they are made here, once).
+ZSTD_CCtx_s* unit_cctx = nullptr;
+constexpr std::size_t UnitDctxs = 8;
+std::atomic<ZSTD_DCtx_s*> unit_dctx[UnitDctxs];
+std::atomic<bool> unit_zstd_ready{false};
+bool UnitZstdStart() noexcept {
+    if (unit_zstd_ready.load(std::memory_order_acquire)) return true;
+    if (!UnitsWanted()) return false;
+    if (unit_cctx == nullptr) unit_cctx = ZSTD_createCCtx();
+    if (unit_cctx == nullptr) return false;
+    for (auto& context : unit_dctx)
+        if (context.load(std::memory_order_relaxed) == nullptr) {
+            ZSTD_DCtx_s* const made = ZSTD_createDCtx();
+            if (made == nullptr) return false;
+            context.store(made, std::memory_order_release);
+        }
+    unit_zstd_ready.store(true, std::memory_order_release);
+    return true;
+}
+bool UnitUnzstd(void* to, const void* from, std::size_t size) noexcept {
+    for (;;) {
+        for (auto& context : unit_dctx) {
+            ZSTD_DCtx_s* const taken = context.exchange(nullptr, std::memory_order_acquire);
+            if (taken == nullptr) continue;
+            const std::size_t out = ZSTD_decompressDCtx(taken, to, SwapUnit, from, size);
+            context.store(taken, std::memory_order_release);
+            return out == SwapUnit;
+        }
+        sched_yield(); // all eight are unpacking
+    }
+}
+
+// What each unit in `mask` of the 2 MiB at `bytes` becomes when it leaves (pack_mutex held): units[u]
+// gets UnitZero, UnitPacked | its place in `packed` (sizes[u] bytes; `packed` is SparseSlot long and
+// filled from `used` on), a slot of the swap store + 1, or 0 for a unit that stays: it would need a
+// write that `writes`, the budget or the store's room do not allow. Returns the new `used`.
+std::size_t UnitsOut(const std::uint8_t* bytes, std::uint32_t mask, std::uint32_t* units, std::uint16_t* sizes,
+                     std::uint8_t* packed, std::size_t used, SwapWrites writes, bool* wrote) noexcept {
+    std::uint64_t hashes[SwapUnits];
+    std::uint32_t fresh = 0;
+    std::size_t found = 0, zeroes = 0;
+    const bool store = SwapOn();
+    for (std::size_t unit = 0; unit < SwapUnits; ++unit) {
+        if (!(mask >> unit & 1)) continue;
+        const std::uint8_t* const here = bytes + unit * SwapUnit;
+        units[unit] = 0;
+        sizes[unit] = 0;
+        if (SwapUnitZero(here)) {
+            units[unit] = UnitZero;
+            ++zeroes;
+            continue;
+        }
+        // (A capacity of UnitPackMax: zstd gives up where the unit would be larger.)
+        const std::size_t size = used + UnitPackMax <= SparseSlot && unit_cctx != nullptr
+                                     ? ZSTD_compressCCtx(unit_cctx, packed + used, UnitPackMax, here, SwapUnit, 1) : 0;
+        if (size != 0 && !ZSTD_isError(size) && size <= UnitPackMax) {
+            units[unit] = UnitPacked | static_cast<std::uint32_t>(used);
+            sizes[unit] = static_cast<std::uint16_t>(size);
+            used += size;
+            continue;
+        }
+        if (!store) continue;
+        hashes[unit] = SwapUnitHash(here);
+        units[unit] = SwapFind(here, hashes[unit]);
+        if (units[unit] != 0) ++found;
+        else if (writes != SwapWrites::None) fresh |= 1u << unit;
+    }
+    if (fresh != 0) {
+        const std::size_t count = static_cast<std::size_t>(__builtin_popcount(fresh));
+        if (swap_count + count > swap_limit) {
+            swap_full.fetch_add(1, std::memory_order_relaxed);
+            swap_refused = true;
+        } else if (!SwapBudget(count * SwapUnit, writes == SwapWrites::Urgent)) {
+            swap_refused = true;
+        } else {
+            // One write for them, side by side (SwapOutSlot has why).
+            std::uint64_t gathered[SwapUnits];
+            std::size_t next = 0;
+            for (std::size_t unit = 0; unit < SwapUnits; ++unit)
+                if (fresh >> unit & 1) {
+                    gathered[next] = hashes[unit];
+                    std::memcpy(swap_gather + next * SwapUnit, bytes + unit * SwapUnit, SwapUnit);
+                    ++next;
+                }
+            const std::uint32_t first = SwapAppend(swap_gather, gathered, count);
+            if (first == 0) {
+                SwapOff("a write failed");
+            } else {
+                next = 0;
+                for (std::size_t unit = 0; unit < SwapUnits; ++unit)
+                    if (fresh >> unit & 1) units[unit] = first + static_cast<std::uint32_t>(next++);
+                if (wrote != nullptr) *wrote = true;
+            }
+        }
+    }
+    swap_found.fetch_add(found, std::memory_order_relaxed);
+    swap_zero_units.fetch_add(zeroes, std::memory_order_relaxed);
+    return used;
+}
+// A unit's 64 KiB into `to`, from its record (not one with memory of its own): zeroes, its bytes in
+// the slot's packed piece, or its slot of the swap store, checked against the hash the store's
+// index has for it. A fault handler: no lock, nothing allocated. False when they did not come back
+// as they went.
+bool UnitFill(std::uint8_t* to, std::uint32_t record, std::uint16_t size, const std::uint8_t* piece) noexcept {
+    if (record == UnitZero) {
+        std::memset(to, 0, SwapUnit);
+        return true;
+    }
+    if (record & UnitPacked) return piece != nullptr && UnitUnzstd(to, piece + (record & UnitIndex), size);
+    if (record == 0 || record > SwapMaxSlots) return false;
+    return SwapReadAt(swap_store_fd, to, SwapUnit, std::uint64_t{record - 1} * SwapUnit) &&
+           SwapUnitHash(to) == swap_hashes[record - 1];
+}
+
+#ifdef PS5_NATIVE
+// Slabs: blocks of the pool cut into units. slab i is seen at slab_base + i * 2 MiB by the service
+// alone, for as long as it has a unit taken.
+constexpr std::size_t UnitSlabs = 4096;
+std::uintptr_t slab_base = 0;
+std::int64_t slab_physical[UnitSlabs];
+std::uint32_t slab_used[UnitSlabs];
+std::uint32_t* slab_owner = nullptr; // per unit of a slab: slot * SwapUnits + unit + 1 of who has it
+std::atomic_flag slab_lock = ATOMIC_FLAG_INIT;
+std::atomic<std::size_t> slab_held{0}, slab_units{0};
+// (pack_mutex held; not in a fault handler)
+bool SlabStart() noexcept {
+    if (slab_base != 0) return true;
+    if (slab_owner == nullptr) slab_owner = new (std::nothrow) std::uint32_t[UnitSlabs * SwapUnits]();
+    if (slab_owner == nullptr) return false;
+    void* address = reinterpret_cast<void*>(cpu_mapping_hint);
+    if (sceKernelReserveVirtualRange(&address, UnitSlabs * SparseSlot, 0, SparseSlot) != 0) return false;
+    for (std::size_t i = 0; i < UnitSlabs; ++i) slab_physical[i] = -1, slab_used[i] = 0;
+    slab_base = reinterpret_cast<std::uintptr_t>(address);
+    return true;
+}
+std::uint8_t* UnitView(std::uint32_t index) noexcept {
+    return reinterpret_cast<std::uint8_t*>(slab_base + std::size_t{index} * SwapUnit);
+}
+std::int64_t UnitPhysical(std::uint32_t index) noexcept {
+    return slab_physical[index / SwapUnits] + static_cast<std::int64_t>((index % SwapUnits) * SwapUnit);
+}
+// A unit of memory: from the first slab with room, else from a new one. `below`: only from slabs
+// before that one, and no new slab (SlabCompact). False when the pool has no block.
+bool UnitTake(std::uint32_t* index, std::size_t below = UnitSlabs) noexcept {
+    Spin(slab_lock);
+    std::size_t empty = UnitSlabs;
+    for (std::size_t i = 0; i < below; ++i) {
+        if (slab_physical[i] < 0) {
+            if (empty == UnitSlabs) empty = i;
+            continue;
+        }
+        if (slab_used[i] == 0xFFFFFFFFu) continue;
+        const unsigned bit = static_cast<unsigned>(__builtin_ctz(~slab_used[i]));
+        slab_used[i] |= 1u << bit;
+        slab_lock.clear(std::memory_order_release);
+        *index = static_cast<std::uint32_t>(i * SwapUnits + bit);
+        slab_units.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    std::int64_t physical = -1;
+    if (below != UnitSlabs || empty == UnitSlabs ||
+        (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !UnpackBlock(&physical) && !ReserveBlock(&physical))) {
+        slab_lock.clear(std::memory_order_release);
+        return false;
+    }
+    if (!MapSlot(slab_base + empty * SparseSlot, PROT_READ | PROT_WRITE, physical)) {
+        slab_lock.clear(std::memory_order_release);
+        (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
+        return false;
+    }
+    slab_physical[empty] = physical;
+    slab_used[empty] = 1;
+    slab_lock.clear(std::memory_order_release);
+    *index = static_cast<std::uint32_t>(empty * SwapUnits);
+    slab_held.fetch_add(SparseSlot, std::memory_order_relaxed);
+    slab_units.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+// A unit of memory goes back (it is mapped at no address any more). A slab with none taken goes back
+// to the pool. Returns whether one did.
+bool UnitGive(std::uint32_t index) noexcept {
+    const std::size_t slab = index / SwapUnits;
+    std::int64_t gone = -1;
+    Spin(slab_lock);
+    slab_used[slab] &= ~(1u << (index % SwapUnits));
+    slab_owner[index] = 0;
+    // (Its view first: memory that went back must not stay in reach.)
+    if (slab_used[slab] == 0 && MapSlot(slab_base + slab * SparseSlot, PROT_NONE, zero_block))
+        gone = std::exchange(slab_physical[slab], -1);
+    slab_lock.clear(std::memory_order_release);
+    slab_units.fetch_sub(1, std::memory_order_relaxed);
+    if (gone < 0) return false;
+    if (sceKernelReleaseDirectMemory(gone, SparseSlot) != 0) std::abort();
+    slab_held.fetch_sub(SparseSlot, std::memory_order_relaxed);
+    return true;
+}
+bool MapUnit(std::uintptr_t at, int protection, std::int64_t physical) noexcept {
+    void* address = reinterpret_cast<void*>(at);
+    return sceKernelMapDirectMemory(&address, SwapUnit, protection, MAP_FIXED, physical, FinePage) == 0 &&
+           address == reinterpret_cast<void*>(at);
+}
+#endif
+
+// A slot in units gives up all it holds: its units of memory and its packed piece (the slot is
+// locked, and its units are mapped nowhere any more, or its range is going).
+void UnitForget(std::size_t slot) noexcept {
+    PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
+    if (table == nullptr || unit_slots == nullptr || swap_units == nullptr) return;
+#ifdef PS5_NATIVE
+    UnitSlot& state = unit_slots[slot];
+    for (std::size_t unit = 0; unit < SwapUnits; ++unit)
+        if (state.here >> unit & 1) (void)UnitGive(swap_units[slot * SwapUnits + unit] & UnitIndex);
+    guest_committed.fetch_sub(static_cast<std::size_t>(__builtin_popcount(state.here)) * SwapUnit, std::memory_order_relaxed);
+    state = {};
+#endif
+    if (table[slot].data != nullptr) {
+        packed_bytes.fetch_sub(table[slot].size, std::memory_order_relaxed);
+        StoreRelease(table[slot].data, table[slot].size);
+    }
+    packed_count.fetch_sub(1, std::memory_order_relaxed);
+    std::memset(swap_units + slot * SwapUnits, 0, SwapUnits * sizeof(std::uint32_t));
+    table[slot] = {};
+}
+
+#ifdef PS5_NATIVE
+bool UnpackSlot(SparseRange& range, std::size_t slot, std::uint8_t* to, bool for_write) noexcept;
+// A touch of a slot in units, at `address` (a fault handler; the slot is locked): the unit touched
+// gets its memory back, and its access. *to: the slot's state afterwards. *shown_read_only: it was a
+// read of a unit of zeroes, which shows the zero block now; a write there faults once more. False
+// when the pool had no block for a new slab (the caller waits and asks again).
+bool UnitBack(SparseRange& range, std::size_t slot, std::uintptr_t address, bool write, std::uint8_t* to,
+              bool* shown_read_only) noexcept {
+    PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
+    *to = SlotPacked;
+    // The fastmem window shows whole blocks: once it is in use, the slot comes back whole. (The
+    // range's table of aliases is no sign of it: every guest range has one.)
+    if (window_seen.load(std::memory_order_relaxed)) return UnpackSlot(range, slot, to, false);
+    const std::uint64_t start = SwapNow();
+    const std::uintptr_t at = SlotAddress(range, slot);
+    const std::size_t unit = (address - at) / SwapUnit;
+    const std::uintptr_t unit_at = at + unit * SwapUnit;
+    const std::uint32_t bit = 1u << unit;
+    UnitSlot& state = unit_slots[slot];
+    std::uint32_t& record = swap_units[slot * SwapUnits + unit];
+    if (state.here & bit) {
+        // It has its memory: mapped again if it was idle (else another thread came first).
+        if (state.idle & bit) {
+            if (!MapUnit(unit_at, PROT_READ | PROT_WRITE, UnitPhysical(record & UnitIndex))) std::abort();
+            state.idle &= ~bit;
+            if (unit_poor != nullptr) unit_poor[slot] = 0; // it may be written now
+            NoteTouched(slot);
+            unit_woken.fetch_add(1, std::memory_order_relaxed);
+            // (All 32 have memory and the block for the whole slot was not to be had then.)
+            if (state.here == 0xFFFFFFFFu) (void)UnpackSlot(range, slot, to, true);
+        }
+        return true;
+    }
+    // Zeroes that are only read are the zero block's, as a slot of zeroes is.
+    if (record == UnitZero && !write) {
+        if (!MapUnit(unit_at, PROT_READ, zero_block)) std::abort();
+        unit_zero_reads.fetch_add(1, std::memory_order_relaxed);
+        *shown_read_only = true;
+        return true;
+    }
+    std::uint32_t index = 0;
+    if (!UnitTake(&index)) return false;
+    if (!UnitFill(UnitView(index), record, unit_bytes[slot * SwapUnits + unit], static_cast<const std::uint8_t*>(table[slot].data))) {
+        Note("EDEN_CRAM a unit's data did not come back as it went\n");
+        std::abort(); // the guest's data is gone: never carry on
+    }
+    if (!MapUnit(unit_at, PROT_READ | PROT_WRITE, UnitPhysical(index))) {
+        (void)UnitGive(index);
+        return false;
+    }
+    if (record != UnitZero && (record & UnitPacked)) {
+        // Its bytes in the slot's piece are dead; the piece goes when all of it is.
+        state.dead += unit_bytes[slot * SwapUnits + unit];
+        if (state.dead >= table[slot].size) {
+            packed_bytes.fetch_sub(table[slot].size, std::memory_order_relaxed);
+            StoreRelease(table[slot].data, table[slot].size);
+            table[slot].data = nullptr;
+            table[slot].size = 0;
+            state.dead = 0;
+        }
+    }
+    unit_bytes[slot * SwapUnits + unit] = 0;
+    record = UnitHere | index;
+    slab_owner[index] = static_cast<std::uint32_t>(slot * SwapUnits + unit + 1);
+    state.here |= bit;
+    guest_committed.fetch_add(SwapUnit, std::memory_order_relaxed);
+    NoteTouched(slot);
+    unit_backs.fetch_add(1, std::memory_order_relaxed);
+    unit_back_ns.fetch_add(SwapNow() - start, std::memory_order_relaxed);
+    // All of it has memory again: one block, and one mapping (a copy, nothing is read).
+    if (state.here == 0xFFFFFFFFu) (void)UnpackSlot(range, slot, to, true);
+    return true;
+}
+
+// A slot in units -> Own: a block of its own with every unit's bytes in it (the slot is locked).
+bool UnpackUnits(SparseRange& range, std::size_t slot, std::uint8_t* to) noexcept {
+    PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
+    const std::uintptr_t at = SlotAddress(range, slot);
+    UnitSlot& state = unit_slots[slot];
+    std::int64_t physical = -1;
+    if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !UnpackBlock(&physical) && !ReserveBlock(&physical))
+        return false;
+    void* const view = MapView(physical, SparseSlot, PROT_READ | PROT_WRITE, SparseSlot);
+    if (view == nullptr) {
+        (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
+        return false;
+    }
+    // No access to any of it while its units are gathered: a write to one that is mapped would be
+    // lost. One reservation over the slot; the units keep their memory, read through the slabs' views.
+    const std::uint32_t awake = state.here & ~state.idle;
+    if (ReserveOver(reinterpret_cast<void*>(at), SparseSlot, SparseSlot) != 1) std::abort();
+    state.idle = state.here;
+    for (std::size_t unit = 0; unit < SwapUnits; ++unit) {
+        auto* const out = static_cast<std::uint8_t*>(view) + unit * SwapUnit;
+        const std::uint32_t record = swap_units[slot * SwapUnits + unit];
+        if (state.here >> unit & 1) {
+            std::memcpy(out, UnitView(record & UnitIndex), SwapUnit);
+        } else if (!UnitFill(out, record, unit_bytes[slot * SwapUnits + unit], static_cast<const std::uint8_t*>(table[slot].data))) {
+            Note("EDEN_CRAM a unit's data did not come back as it went\n");
+            std::abort(); // the guest's data is gone: never carry on
+        }
+    }
+    UnmapView(view, SparseSlot);
+    if (!MapSlot(at, PROT_READ | PROT_WRITE, physical)) {
+        // The slot stays in units; those that were mapped are mapped again.
+        (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
+        for (std::size_t unit = 0; unit < SwapUnits; ++unit)
+            if (awake >> unit & 1) {
+                if (!MapUnit(at + unit * SwapUnit, PROT_READ | PROT_WRITE, UnitPhysical(swap_units[slot * SwapUnits + unit] & UnitIndex)))
+                    std::abort();
+                state.idle &= ~(1u << unit);
+            }
+        return false;
+    }
+    UnitForget(slot);
+    range.physical[slot] = physical;
+    NoteTouched(slot);
+    guest_committed.fetch_add(SparseSlot, std::memory_order_relaxed);
+    unpacks.fetch_add(1, std::memory_order_relaxed);
+    unit_whole.fetch_add(1, std::memory_order_relaxed);
+    *to = SlotOwn;
+    return true;
+}
+#endif
+
 // ---- The changes of a slot (the slot is locked) ----
 
 // Zero -> Own: a zeroed block of its own, read-write.
@@ -1340,6 +1790,7 @@ void ReturnSlot(SparseRange& range, std::size_t slot) noexcept {
 bool UnpackSlot(SparseRange& range, std::size_t slot, std::uint8_t* to, bool for_write = false) noexcept {
 #ifdef PS5_NATIVE
     PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
+    if (table != nullptr && table[slot].units) return UnpackUnits(range, slot, to);
     if (table == nullptr || (table[slot].data == nullptr && table[slot].swap == 0)) std::abort();
     const bool from_swap = table[slot].swap != 0;
     const std::uintptr_t at = SlotAddress(range, slot);
@@ -1744,9 +2195,17 @@ bool HandleGuestWriteFault(void* fault, int write) noexcept {
     counters.faults.fetch_add(1, std::memory_order_relaxed);
     const bool waited = LockSlot(*range, slot, true);
     const std::uint8_t state = SlotState(*range, slot);
-    if (waited) {
+    bool in_units = false;
+#ifdef PS5_NATIVE
+    if (const PackedSlot* const packed = packed_slots.load(std::memory_order_acquire); state == SlotPacked && packed != nullptr)
+        in_units = packed[slot].units;
+#endif
+    if (waited && !in_units) {
         // Someone changed the slot meanwhile (or is mapping it again): the access may now succeed,
         // and a read must never make a Fine slot whole. It faults again if it was a write.
+        // (Not so for a slot in units: who held it brought back a unit, maybe another one. This
+        // unit is looked at now, under the lock; returning to fault again could lose the lock to
+        // other units' threads 16 times running and be refused.)
         UnlockSlot(*range, slot, state);
         return true;
     }
@@ -1765,6 +2224,13 @@ bool HandleGuestWriteFault(void* fault, int write) noexcept {
         } else if (state == SlotShared) {
             done = PromoteShared(*range, slot);
         } else if (state == SlotPacked) {
+#ifdef PS5_NATIVE
+            // In units: the unit touched comes back, the slot stays Packed (a read that faults
+            // again at once is taken for a write, as for a Clean slot below).
+            if (in_units)
+                done = UnitBack(*range, slot, address, write != 0 || repeats > 1, &to, &kept_clean);
+            else
+#endif
             done = UnpackSlot(*range, slot, &to);
             if (done) CountUnpacker(slot);
         } else if (state == SlotIdle) {
@@ -2134,6 +2600,298 @@ std::atomic<std::uint64_t> swap_last_resort{0}; // slots that went to the swap s
 // to the budget's last byte.
 enum class Swap { No, Reuse, Yes, Urgent };
 
+#ifdef PS5_NATIVE
+// ---- Units: how a slot goes in units, and what becomes of its units afterwards (see "Units" above) ----
+std::size_t ProbeColdSeconds() noexcept;
+std::uint8_t* unit_scratch = nullptr; // a slot's packed units, side by side (pack_mutex)
+std::uint8_t* unit_stage = nullptr;   // idle units' bytes at their places in a slot (pack_mutex)
+bool UnitsReady() noexcept {
+    return unit_zstd_ready.load(std::memory_order_acquire) && unit_slots != nullptr && unit_bytes != nullptr &&
+           unit_poor != nullptr && swap_units != nullptr && unit_scratch != nullptr && unit_stage != nullptr &&
+           slab_base != 0 && IdleEnabled() && idle_since != nullptr && !PackKeep();
+}
+
+// Idle -> Packed, in units (the slot is locked and Idle; pack_mutex held).
+bool PackSlotUnits(SparseRange& range, std::size_t slot, Swap swap) noexcept {
+    PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
+    const std::uintptr_t at = SlotAddress(range, slot);
+    const SwapWrites writes = swap == Swap::Urgent ? SwapWrites::Urgent : swap == Swap::Yes ? SwapWrites::Budget : SwapWrites::None;
+    if (writes == SwapWrites::None && unit_poor[slot] != 0) {
+        UnlockSlot(range, slot, SlotIdle);
+        pack_skips.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    // Readable, not writable, while its units are looked at.
+    if (mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_READ) != 0) std::abort();
+    std::uint32_t taken[SwapUnits] = {};
+    std::uint32_t got = 0;
+    const auto leave = [&]() noexcept {
+        for (std::size_t unit = 0; unit < SwapUnits; ++unit)
+            if (got >> unit & 1) (void)UnitGive(taken[unit]);
+        if (mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_NONE) != 0) std::abort();
+        UnlockSlot(range, slot, SlotIdle);
+        pack_skips.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    std::uint32_t units[SwapUnits];
+    std::uint16_t sizes[SwapUnits];
+    bool wrote = false;
+    const std::size_t used = UnitsOut(reinterpret_cast<const std::uint8_t*>(at), 0xFFFFFFFFu, units, sizes, unit_scratch, 0, writes, &wrote);
+    std::uint32_t stay = 0;
+    std::size_t packed_units = 0;
+    for (std::size_t unit = 0; unit < SwapUnits; ++unit) {
+        if (units[unit] == 0) stay |= 1u << unit;
+        else if (units[unit] != UnitZero && (units[unit] & UnitPacked)) ++packed_units;
+    }
+    const std::size_t staying = static_cast<std::size_t>(__builtin_popcount(stay));
+    if (stay != 0 && SparseSlot - staying * SwapUnit - used < UnitMinGain) {
+        if (writes == SwapWrites::None) unit_poor[slot] = 1;
+        return leave();
+    }
+    // Memory of their own for the units that stay.
+    const std::size_t slabs_before = slab_held.load(std::memory_order_relaxed);
+    for (std::size_t unit = 0; unit < SwapUnits; ++unit) {
+        if (!(stay >> unit & 1)) continue;
+        if (!UnitTake(&taken[unit])) return leave();
+        got |= 1u << unit;
+        std::memcpy(UnitView(taken[unit]), reinterpret_cast<const void*>(at + unit * SwapUnit), SwapUnit);
+    }
+    if (used != 0 && !StoreStart()) return leave();
+    DropSlotAliases(range, slot);
+    // The slot's address space is a reservation from here: every access faults and waits for the slot.
+    const int reserved = ReserveOver(reinterpret_cast<void*>(at), SparseSlot, SparseSlot);
+    if (reserved == -1) return leave();
+    if (reserved != 1) std::abort(); // unmapped and not reserved: another mapping could land in the guest's range
+    std::int64_t donate = range.physical[slot];
+    void* data = nullptr;
+    if (used != 0) {
+        data = StoreAlloc(used, &donate);
+        if (data == nullptr) {
+            // No room in the packed store: the block, untouched, comes back.
+            if (!MapSlot(at, PROT_NONE, range.physical[slot])) std::abort();
+            for (std::size_t unit = 0; unit < SwapUnits; ++unit)
+                if (got >> unit & 1) (void)UnitGive(taken[unit]);
+            UnlockSlot(range, slot, SlotIdle);
+            pack_skips.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        std::memcpy(data, unit_scratch, used);
+    }
+    pack_released = false;
+    if (donate >= 0 && (recovering || !KeepForUnpack(donate))) {
+        if (sceKernelReleaseDirectMemory(donate, SparseSlot) != 0) std::abort();
+        // (Not counted as given back when the units that stay took a new slab.)
+        pack_released = slab_held.load(std::memory_order_relaxed) <= slabs_before;
+    }
+    range.physical[slot] = -1;
+    for (std::size_t unit = 0; unit < SwapUnits; ++unit) {
+        const bool stays = (stay >> unit & 1) != 0;
+        swap_units[slot * SwapUnits + unit] = stays ? UnitHere | taken[unit] : units[unit];
+        unit_bytes[slot * SwapUnits + unit] = stays ? std::uint16_t{0} : sizes[unit];
+        if (stays) slab_owner[taken[unit]] = static_cast<std::uint32_t>(slot * SwapUnits + unit + 1);
+    }
+    unit_slots[slot] = {stay, stay, idle_since[slot], 0};
+    table[slot] = {data, static_cast<std::uint32_t>(used), 0, 0, true};
+    guest_committed.fetch_sub(SparseSlot - staying * SwapUnit, std::memory_order_relaxed);
+    packed_count.fetch_add(1, std::memory_order_relaxed);
+    packed_bytes.fetch_add(used, std::memory_order_relaxed);
+    packs.fetch_add(1, std::memory_order_relaxed);
+    unit_slots_made.fetch_add(1, std::memory_order_relaxed);
+    unit_packed.fetch_add(packed_units, std::memory_order_relaxed);
+    unit_stayed.fetch_add(staying, std::memory_order_relaxed);
+    if (wrote && slot < cold_since.size()) NoteSwapWrite(slot, ColdNow() - cold_since[slot], true);
+    UnlockSlot(range, slot, SlotPacked);
+    return true;
+}
+
+// The idle units of a slot in units go the way its others went (the slot is locked; pack_mutex
+// held). Returns how many went; *blocks: slabs that went back to the pool with them.
+std::size_t UnitsEvict(std::size_t slot, SwapWrites writes, std::size_t* blocks) noexcept {
+    PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
+    UnitSlot& state = unit_slots[slot];
+    const std::uint32_t mask = state.idle & state.here;
+    if (mask == 0) return 0;
+    std::uint32_t* const records = swap_units + slot * SwapUnits;
+    std::uint16_t* const bytes = unit_bytes + slot * SwapUnits;
+    // The slot's packed piece is made anew: the units it still holds first, then those that join them.
+    std::uint32_t moved[SwapUnits];
+    std::size_t used = 0;
+    const auto* const old = static_cast<const std::uint8_t*>(table[slot].data);
+    for (std::size_t unit = 0; unit < SwapUnits; ++unit) {
+        moved[unit] = records[unit];
+        if ((state.here >> unit & 1) || records[unit] == UnitZero || !(records[unit] & UnitPacked)) continue;
+        if (old == nullptr) return 0; // (never: a packed unit has its piece)
+        std::memcpy(unit_scratch + used, old + (records[unit] & UnitIndex), bytes[unit]);
+        moved[unit] = UnitPacked | static_cast<std::uint32_t>(used);
+        used += bytes[unit];
+    }
+    for (std::size_t unit = 0; unit < SwapUnits; ++unit)
+        if (mask >> unit & 1) std::memcpy(unit_stage + unit * SwapUnit, UnitView(records[unit] & UnitIndex), SwapUnit);
+    std::uint32_t units[SwapUnits];
+    std::uint16_t sizes[SwapUnits];
+    bool wrote = false;
+    used = UnitsOut(unit_stage, mask, units, sizes, unit_scratch, used, writes, &wrote);
+    std::uint32_t going = 0;
+    for (std::size_t unit = 0; unit < SwapUnits; ++unit)
+        if ((mask >> unit & 1) && units[unit] != 0) going |= 1u << unit;
+    if (going == 0) {
+        if (writes == SwapWrites::None) unit_poor[slot] = 1;
+        return 0;
+    }
+    void* fresh = nullptr;
+    bool anew = true;
+    if (used != 0) {
+        if (StoreStart()) fresh = StoreAlloc(used, nullptr);
+        if (fresh != nullptr) {
+            std::memcpy(fresh, unit_scratch, used);
+        } else {
+            // The pool has no block for the packed store now (this runs when memory is short). The
+            // old piece stays as it is, the units that were to join it stay in memory, and those
+            // that are zeroes or in the swap store go: what was appended for them is not lost.
+            anew = false;
+            for (std::size_t unit = 0; unit < SwapUnits; ++unit)
+                if ((going >> unit & 1) && units[unit] != UnitZero && (units[unit] & UnitPacked)) going &= ~(1u << unit);
+            if (going == 0) return 0;
+        }
+    }
+    if (anew) {
+        if (table[slot].data != nullptr) {
+            packed_bytes.fetch_sub(table[slot].size, std::memory_order_relaxed);
+            StoreRelease(table[slot].data, table[slot].size);
+        }
+        packed_bytes.fetch_add(used, std::memory_order_relaxed);
+        table[slot].data = fresh;
+        table[slot].size = static_cast<std::uint32_t>(used);
+        state.dead = 0;
+    }
+    std::size_t gone = 0;
+    for (std::size_t unit = 0; unit < SwapUnits; ++unit) {
+        if (going >> unit & 1) {
+            const std::uint32_t index = records[unit] & UnitIndex;
+            records[unit] = units[unit];
+            bytes[unit] = sizes[unit];
+            if (UnitGive(index) && blocks != nullptr) ++*blocks;
+            ++gone;
+        } else if (anew && !(state.here >> unit & 1)) {
+            records[unit] = moved[unit];
+        }
+    }
+    state.here &= ~going;
+    state.idle &= ~going;
+    guest_committed.fetch_sub(gone * SwapUnit, std::memory_order_relaxed);
+    unit_evicted.fetch_add(gone, std::memory_order_relaxed);
+    return gone;
+}
+
+// Idle units move out of the slabs that hold few, from the last slab down into room before it, so
+// that those slabs go back to the pool (pack_mutex held). A unit that is mapped stays where it is.
+void SlabCompact(SparseRange& range) noexcept {
+    PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
+    if (table == nullptr || slab_base == 0) return;
+    std::size_t moves = 0;
+    for (std::size_t slab = UnitSlabs; slab-- > 0 && moves < 512;) {
+        Spin(slab_lock);
+        const std::uint32_t used = slab_physical[slab] >= 0 ? slab_used[slab] : 0;
+        slab_lock.clear(std::memory_order_release);
+        if (used == 0 || __builtin_popcount(used) > 8) continue;
+        for (std::size_t bit = 0; bit < SwapUnits; ++bit) {
+            if (!(used >> bit & 1)) continue;
+            const std::uint32_t index = static_cast<std::uint32_t>(slab * SwapUnits + bit);
+            const std::uint32_t owner = slab_owner[index]; // (looked at again under the slot's lock)
+            if (owner == 0) continue;
+            const std::size_t slot = (owner - 1) / SwapUnits, unit = (owner - 1) % SwapUnits;
+            if (!TryLockSlot(range, slot)) continue;
+            const std::uint8_t slot_state = SlotState(range, slot);
+            bool room = true;
+            if (slot_state == SlotPacked && table[slot].units && (unit_slots[slot].here >> unit & 1) &&
+                (unit_slots[slot].idle >> unit & 1) && swap_units[slot * SwapUnits + unit] == (UnitHere | index)) {
+                std::uint32_t fresh = 0;
+                room = UnitTake(&fresh, slab);
+                if (room) {
+                    std::memcpy(UnitView(fresh), UnitView(index), SwapUnit);
+                    swap_units[slot * SwapUnits + unit] = UnitHere | fresh;
+                    slab_owner[fresh] = owner;
+                    (void)UnitGive(index);
+                    ++moves;
+                }
+            }
+            UnlockSlot(range, slot, slot_state);
+            if (!room) {
+                unit_moved.fetch_add(moves, std::memory_order_relaxed);
+                return; // no slab before this one has room
+            }
+        }
+    }
+    unit_moved.fetch_add(moves, std::memory_order_relaxed);
+}
+
+// Each slot in units, once a pass or at a request for memory (pack_mutex held): units still idle
+// after `idle_for` seconds go; and, for the pass (`cool`), the units of a slot left alone for its
+// time lose their access, in one reservation over the slot. Stops once `want` bytes of slabs went
+// back (0: no such end). Returns the bytes of slabs that went back to the pool.
+std::size_t UnitSweep(SparseRange& range, std::uint32_t now, std::size_t idle_for, bool cool, SwapWrites writes,
+                      std::size_t want) noexcept {
+    PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
+    if (table == nullptr || !UnitsReady()) return 0;
+    const std::size_t slots = (range.end - range.begin.load(std::memory_order_relaxed)) / SparseSlot;
+    const std::size_t before = slab_held.load(std::memory_order_relaxed);
+    const std::size_t store_before = store_held.load(std::memory_order_relaxed);
+    std::size_t evicted = 0, blocks = 0;
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (SlotState(range, slot) != SlotPacked || !table[slot].units) continue;
+        const UnitSlot peek = unit_slots[slot]; // (looked at again under the slot's lock)
+        const bool due = peek.idle != 0 && now - peek.idle_since >= idle_for &&
+                         !(writes == SwapWrites::None && unit_poor[slot] != 0);
+        const bool cools = cool && (peek.here & ~peek.idle) != 0 &&
+                           now - touch_since[slot].load(std::memory_order_relaxed) >=
+                               (IdleBackoff() << std::min<unsigned>(touch_times[slot].load(std::memory_order_relaxed), 3));
+        if (!due && !cools) continue;
+        if (!TryLockSlot(range, slot)) continue;
+        // (Another thread may have made it whole, or given it back, between the look and the lock.)
+        const std::uint8_t found = SlotState(range, slot);
+        if (found == SlotPacked && table[slot].units) {
+            UnitSlot& state = unit_slots[slot];
+            if (state.idle != 0 && now - state.idle_since >= idle_for && !(writes == SwapWrites::None && unit_poor[slot] != 0)) {
+                evicted += UnitsEvict(slot, writes, &blocks);
+            } else if (cool && (state.here & ~state.idle) != 0) {
+                // Not while they are written: the sampled hash of the units with access must have
+                // stood still for ProbeColdSeconds, as a slot's must (ProbeSlot has why).
+                const std::uint32_t awake = state.here & ~state.idle;
+                std::uint64_t hash = awake;
+                for (std::size_t unit = 0; unit < SwapUnits; ++unit) {
+                    if (!(awake >> unit & 1)) continue;
+                    const auto* const word =
+                        reinterpret_cast<const volatile std::uint64_t*>(UnitView(swap_units[slot * SwapUnits + unit] & UnitIndex));
+                    for (std::size_t i = 0; i < SwapUnit / 8; i += SwapUnit / 8 / 16) hash = Mix(hash, word[i] ^ word[i + 1]);
+                }
+                if (slot >= cold_hash.size() || slot >= cold_since.size()) {
+                    // (no place to keep the hash: left as it is)
+                } else if (cold_hash[slot] != hash) {
+                    cold_hash[slot] = hash;
+                    cold_since[slot] = now;
+                } else if (now - cold_since[slot] >= ProbeColdSeconds()) {
+                    const int reserved = ReserveOver(reinterpret_cast<void*>(SlotAddress(range, slot)), SparseSlot, SparseSlot);
+                    if (reserved == 0) std::abort(); // unmapped and not reserved
+                    if (reserved == 1) {
+                        // (Units idle since before keep their time: they go when theirs is up.)
+                        if (state.idle == 0) state.idle_since = now;
+                        state.idle = state.here;
+                        idled.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
+        UnlockSlot(range, slot, found);
+        if (swap_refused && writes != SwapWrites::None) break;
+        if (want != 0 && blocks * SparseSlot >= want) break;
+    }
+    if (evicted != 0) SlabCompact(range);
+    // Less what the packed store took for the units that went into it.
+    const std::size_t after = slab_held.load(std::memory_order_relaxed) + store_held.load(std::memory_order_relaxed);
+    return before + store_before > after ? before + store_before - after : 0;
+}
+#endif
+
 // Idle -> Packed (Own, without Idle slots): the scanner, or a recovery (pack_mutex held). Readable
 // and not writable while it is compressed, then the zero block with no access.
 bool PackSlot(SparseRange& range, std::size_t slot, Swap swap = Swap::No) noexcept {
@@ -2173,6 +2931,8 @@ bool PackSlot(SparseRange& range, std::size_t slot, Swap swap = Swap::No) noexce
         return false;
     };
     const bool in_swap = table[slot].swap != 0; // Idle from Clean: the swap store has its bytes, and where is known
+    // In units, when they are on (a slot with a whole copy in the swap store goes as it always did).
+    if (!in_swap && before == SlotIdle && UnitsReady()) return PackSlotUnits(range, slot, swap);
     if (in_swap && swap == Swap::No) {
         UnlockSlot(range, slot, before);
         return false;
@@ -2447,6 +3207,10 @@ void ColdPass(SparseRange& range, std::size_t slots) noexcept {
             continue;
         }
         if (state != SlotOwn && state != SlotClean) {
+            // (A slot in units keeps its hash here: UnitSweep, at the end of the pass, compares it.)
+            if (const PackedSlot* const packed = packed_slots.load(std::memory_order_acquire);
+                state == SlotPacked && packed != nullptr && packed[slot].units)
+                continue;
             cold_since[slot] = now;
             cold_hash[slot] = 0;
             continue;
@@ -2463,6 +3227,7 @@ void ColdPass(SparseRange& range, std::size_t slots) noexcept {
                 cold_since[slot] = now;
                 cold_hash[slot] = hash;
                 if (pack_raw != nullptr) pack_raw[slot] = 0; // written: it may compress now
+                if (unit_poor != nullptr) unit_poor[slot] = 0;
                 if (swap_absent != nullptr) swap_absent[slot] = 0;
             }
             age = now - cold_since[slot];
@@ -2604,6 +3369,18 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
         if (swap_rewritten == nullptr) swap_rewritten = new (std::nothrow) std::atomic<std::uint8_t>[slots]();
         if (rewrite_noted == nullptr) rewrite_noted = new (std::nothrow) std::atomic<std::uint8_t>[slots]();
         if (swap_age_class == nullptr) swap_age_class = new (std::nothrow) std::uint8_t[slots]();
+#ifdef PS5_NATIVE
+        // Slots in units ("Units"): their tables, the slabs' address space and zstd's contexts.
+        if (UnitsWanted()) {
+            if (unit_slots == nullptr) unit_slots = new (std::nothrow) UnitSlot[slots]();
+            if (unit_bytes == nullptr) unit_bytes = new (std::nothrow) std::uint16_t[slots * SwapUnits]();
+            if (unit_poor == nullptr) unit_poor = new (std::nothrow) std::uint8_t[slots]();
+            if (unit_scratch == nullptr) unit_scratch = new (std::nothrow) std::uint8_t[SparseSlot];
+            if (unit_stage == nullptr) unit_stage = new (std::nothrow) std::uint8_t[SparseSlot];
+            (void)UnitZstdStart();
+            (void)SlabStart();
+        }
+#endif
         packed_slots.store(table, std::memory_order_release);
         pack_times.assign(slots, 0);
         recover_order.reserve(slots);
@@ -2650,6 +3427,11 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
         }
         dry = dry || swap_refused;
     }
+#ifdef PS5_NATIVE
+    // Slots in units: units still idle go, and those left alone for their time lose their access.
+    swap_refused = false;
+    (void)UnitSweep(range, now, IdleSeconds(), true, pass_swaps >= 2 && !dry ? SwapWrites::Budget : SwapWrites::None, 0);
+#endif
     static const bool pass_log = EnvOr("EDEN_SWAP_LOG", 0) != 0;
     if (pass_log) {
         char line[240];
@@ -2706,6 +3488,7 @@ void ScanPass(SparseRange& range) noexcept {
 void ServiceReport(SparseRange& range, const char* when) noexcept {
     const std::size_t slots = (range.end - range.begin.load(std::memory_order_relaxed)) / SparseSlot;
     std::size_t own = 0, shared = 0, fine = 0, fine_kept = 0, idle = 0, clean = 0, packed = 0, swapped_out = 0;
+    std::size_t in_units = 0, units_here = 0, units_idle = 0;
     std::size_t kinds[4] = {}; // slots that hold data, by how often they were written again (swap_rewritten)
     PackedSlot* const packed_table = packed_slots.load(std::memory_order_acquire);
     for (std::size_t slot = 0; slot < slots; ++slot) {
@@ -2718,6 +3501,11 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         clean += state == SlotClean;
         packed += state == SlotPacked;
         swapped_out += state == SlotPacked && packed_table != nullptr && packed_table[slot].swap != 0;
+        if (state == SlotPacked && packed_table != nullptr && packed_table[slot].units && unit_slots != nullptr) {
+            ++in_units;
+            units_here += static_cast<std::size_t>(__builtin_popcount(unit_slots[slot].here));
+            units_idle += static_cast<std::size_t>(__builtin_popcount(unit_slots[slot].idle));
+        }
         shared += state == SlotShared;
         if (state == SlotFine) {
             ++fine;
@@ -2824,6 +3612,25 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             (unsigned long long)clean_late_reads.load(std::memory_order_relaxed),
             (unsigned long long)clean_refaults.load(std::memory_order_relaxed));
         if (swap_length > 0) Report(swap_line);
+#ifdef PS5_NATIVE
+        // Slots in units: how many, what their units hold in memory (and how much of it without
+        // access), what the slabs hold for them, and what became of units so far.
+        const std::uint64_t backs = unit_backs.load(std::memory_order_relaxed);
+        const int unit_length = std::snprintf(swap_line, sizeof(swap_line),
+            "EDEN_UNITS %s on=%d slots=%zu here=%zuMiB idle=%zuMiB slabs=%zuMiB made=%llu packed=%llu stayed=%llu "
+            "backs=%llu back_avg_us=%llu zero_reads=%llu woken=%llu evicted=%llu moved=%llu whole=%llu\n",
+            when, UnitsReady() ? 1 : 0, in_units, units_here * SwapUnit >> 20, units_idle * SwapUnit >> 20,
+            slab_held.load(std::memory_order_relaxed) >> 20, (unsigned long long)unit_slots_made.load(std::memory_order_relaxed),
+            (unsigned long long)unit_packed.load(std::memory_order_relaxed),
+            (unsigned long long)unit_stayed.load(std::memory_order_relaxed), (unsigned long long)backs,
+            (unsigned long long)(backs ? unit_back_ns.load(std::memory_order_relaxed) / backs / 1000 : 0),
+            (unsigned long long)unit_zero_reads.load(std::memory_order_relaxed),
+            (unsigned long long)unit_woken.load(std::memory_order_relaxed),
+            (unsigned long long)unit_evicted.load(std::memory_order_relaxed),
+            (unsigned long long)unit_moved.load(std::memory_order_relaxed),
+            (unsigned long long)unit_whole.load(std::memory_order_relaxed));
+        if (unit_length > 0) Report(swap_line);
+#endif
         // Slots written by how long they had been unwritten (under 30 s, 60 s, 2, 5, 10 min, more)
         // and by how often they had been written again before (never, once, twice, more), with how
         // many of each a later write dropped; and the slots that hold data now, by the same count.
@@ -3125,6 +3932,9 @@ void ReleaseServiceBlocks(SparseRange& range) noexcept {
         delete[] std::exchange(swap_rewritten, nullptr);
         delete[] std::exchange(rewrite_noted, nullptr);
         delete[] std::exchange(swap_age_class, nullptr);
+        delete[] std::exchange(unit_slots, nullptr);
+        delete[] std::exchange(unit_bytes, nullptr);
+        delete[] std::exchange(unit_poor, nullptr);
     }
 #else
     const std::size_t slots = (range.end - range.begin.load(std::memory_order_relaxed)) / SparseSlot;
@@ -3326,6 +4136,12 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait, bool driver = true, int 
                 if (pack_times[slot] < 255) ++pack_times[slot];
             }
         }
+        // Slots in units: their idle units go too, with what the store lacks of them written from
+        // step 1 on.
+        if (freed + given < bytes && step < 2 && !(step != 0 && swap_refused) && UnitsReady())
+            freed += UnitSweep(*range, now, keeper ? IdleSeconds() : UrgentIdleSeconds(), false,
+                               step == 0 ? SwapWrites::None : keeper ? SwapWrites::Budget : SwapWrites::Urgent,
+                               bytes - freed - given);
         recovering = false;
     }
     if (keeper) {
@@ -3371,6 +4187,10 @@ namespace {
 // allocation, the only ones that show memory is needed, came 42 times. Free memory also draws
 // takers: the graphics caches keep more when the pool has more. EDEN_SWAP_KEEPER=1 lets it
 // write again (slots unwritten for KeeperColdSeconds and never written again after a while).
+// What the pool had free in 2 MiB pieces when the keeper last counted them (it does while the
+// largest free block is under its mark), for eden_pool_free_pieces.
+std::atomic<std::size_t> pool_free_seen{0};
+std::atomic<std::uint64_t> pool_free_seen_ns{0};
 std::size_t KeepFreeMark() noexcept {
     static const std::size_t bytes = EnvOr("EDEN_CRAM_KEEP_FREE_MIB", 512) << 20;
     return bytes;
@@ -3389,6 +4209,8 @@ void KeepFree() noexcept {
         sceKernelAvailableDirectMemorySize(0, total, SparseSlot, &start, &largest) != 0 || largest >= mark)
         return;
     const std::size_t free_pieces = PoolFreePieces();
+    pool_free_seen.store(free_pieces, std::memory_order_relaxed);
+    pool_free_seen_ns.store(SwapNow(), std::memory_order_release);
     static std::uint64_t below_since = 0; // the keeper's thread only
     if (free_pieces >= mark) {
         below_since = 0;
@@ -3410,6 +4232,21 @@ void KeepFree() noexcept {
 extern "C" std::size_t eden_memory_recover(std::size_t bytes) noexcept { return RecoverMemory(bytes, true); }
 // Never waits: for the heap, which may hold its growth lock while the scanner allocates.
 extern "C" std::size_t eden_memory_recover_try(std::size_t bytes) noexcept { return RecoverMemory(bytes, false); }
+// What the pool has free in 2 MiB pieces, as the keeper counted it within the last half second; 0
+// when it has not (the largest free block is then above the keeper's mark, and says enough).
+// headless/performance.cpp tells the graphics caches: the driver takes memory in such pieces
+// (tools/patch-radv-pieces.py), so the largest free block alone understates what it can have. After
+// PS5_Lichii's driver, whose budget and available memory "count the whole shared pool, in 2 MiB
+// pieces" (docs/ps5/levers.md there).
+extern "C" std::size_t eden_pool_free_pieces(void) noexcept {
+#ifdef PS5_NATIVE
+    const std::uint64_t seen = pool_free_seen_ns.load(std::memory_order_acquire);
+    if (seen == 0 || SwapNow() - seen > 500'000'000ull) return 0;
+    return pool_free_seen.load(std::memory_order_relaxed);
+#else
+    return 0;
+#endif
+}
 // The swap store as numbers, for the crash report (a signal handler: plain reads, no lock): MiB it
 // holds, MiB it may hold, MiB written this session, slots the budget refused, slots its size
 // refused. Returns 0 while it is not opened, 1 when it is on, 2 when it is off.
@@ -3586,6 +4423,7 @@ bool AliasGuestSlot(std::uintptr_t backing, std::uintptr_t window_at, bool writa
 #ifdef PS5_NATIVE
     auto* range = guest_range.load(std::memory_order_acquire);
     if (!range || !range->state || !range->aliases) return false;
+    if (!window_seen.load(std::memory_order_relaxed)) window_seen.store(true, std::memory_order_relaxed);
     const std::uintptr_t begin = range->begin.load(std::memory_order_relaxed);
     if (backing < begin || backing >= range->end || (backing - begin) % SparseSlot || window_at % SparseSlot) return false;
     const std::size_t slot = (backing - begin) / SparseSlot;
@@ -3641,6 +4479,7 @@ bool AliasGuestPage(std::uintptr_t backing, std::uintptr_t at, std::uintptr_t re
 #ifdef PS5_NATIVE
     auto* range = guest_range.load(std::memory_order_acquire);
     if (!range || !range->state || !range->aliases) return false;
+    if (!window_seen.load(std::memory_order_relaxed)) window_seen.store(true, std::memory_order_relaxed);
     const std::uintptr_t begin = range->begin.load(std::memory_order_relaxed);
     if (backing < begin || backing >= range->end || (backing - begin) % FinePage || at % FinePage) return false;
     const std::size_t slot = (backing - begin) / SparseSlot;
@@ -3689,6 +4528,7 @@ bool AliasGuestPage(std::uintptr_t backing, std::uintptr_t at, std::uintptr_t re
 bool DropGuestAlias(std::uintptr_t backing, std::uintptr_t window_at) noexcept {
     auto* range = guest_range.load(std::memory_order_acquire);
     if (!range || !range->state || !range->aliases) return false;
+    if (!window_seen.load(std::memory_order_relaxed)) window_seen.store(true, std::memory_order_relaxed);
     const std::uintptr_t begin = range->begin.load(std::memory_order_relaxed);
     if (backing < begin || backing >= range->end) return false;
     const std::size_t slot = (backing - begin) / SparseSlot;

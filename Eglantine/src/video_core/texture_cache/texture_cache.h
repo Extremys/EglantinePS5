@@ -2379,8 +2379,62 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
+    // An image from the texture store is filled from its file: no staging buffer for the guest's
+    // bytes and no decode. From PS5_Lichii (mihawk, codeberg.org/mihawk/PS5_Lichii),
+    // src/video_core/texture_cache/texture_cache.h.
+    bool stored = false;
+    if constexpr (requires { runtime.UploadStoredAstc(image); }) {
+        if (image.info.astc_store_key != 0) {
+            stored = true;
+            bool known = true;
+            if (image.astc_store_loaded) {
+                // Uploaded before, so the guest has written its memory (or a page it shares)
+                // since the key was taken. Lichii uploads the same file again, which shows the old
+                // texture when a streaming game put another one of the same shape there. The bytes
+                // are hashed again: the file of the new ones is uploaded, and while the store has
+                // none (data still arriving, or a store that lacks the texture) the image keeps
+                // what it shows, as it cannot hold anything but BC7.
+                Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead>
+                    guest_data(*gpu_memory, image.gpu_addr, image.guest_size_bytes,
+                               &astc_scan_buffer);
+                const u64 key = runtime.FindStoredAstc(
+                    std::span<const u8>{guest_data.data(), guest_data.size()}, image.info);
+                known = key != 0;
+                if (known) {
+                    image.info.astc_store_key = key;
+                } else {
+                    static u64 unknown{};
+                    if (const u64 count = ++unknown; (count & (count - 1)) == 0) {
+                        LOG_WARNING(HW_GPU,
+                                    "Stored ASTC image {:#x} ({}x{}x{}) was rewritten with bytes "
+                                    "the texture store does not have; it keeps its old texture "
+                                    "({} such uploads so far)",
+                                    image.gpu_addr, image.info.size.width, image.info.size.height,
+                                    image.info.resources.layers, count);
+                    }
+                }
+            }
+            if (known) {
+                if (runtime.UploadStoredAstc(image)) {
+                    image.astc_store_loaded = true;
+                } else {
+                    static u32 logged{};
+                    if (logged++ < 32) {
+                        LOG_ERROR(HW_GPU,
+                                  "The texture store's {:016x} could not be uploaded to its "
+                                  "{}x{}x{} image at {:#x}",
+                                  image.info.astc_store_key, image.info.size.width,
+                                  image.info.size.height, image.info.resources.layers,
+                                  image.gpu_addr);
+                    }
+                }
+            }
+            // Whatever happened above, the image is in the layout its views are bound in.
+            runtime.TransitionImageLayout(image);
+        }
+    }
     if constexpr (std::is_same_v<Runtime, Vulkan::TextureCacheRuntime>) {
-        if (image.info.type == ImageType::e2D && image.info.resources.layers > 1 && image.guest_size_bytes >= LayerUploadMinSize && True(image.flags & ImageFlagBits::Converted) &&
+        if (!stored && image.info.type == ImageType::e2D && image.info.resources.layers > 1 && image.guest_size_bytes >= LayerUploadMinSize && True(image.flags & ImageFlagBits::Converted) &&
             False(image.flags & (ImageFlagBits::AcceleratedUpload | ImageFlagBits::Sparse |
                                  ImageFlagBits::Remapped | ImageFlagBits::Unbacked |
                                  ImageFlagBits::TrimmedLevels))) {
@@ -2410,7 +2464,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
             return;
         }
     }
-    if (!UploadInChunks(image)) {
+    if (stored) {
+        runtime.InsertUploadMemoryBarrier();
+    } else if (!UploadInChunks(image)) {
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
@@ -3382,7 +3438,18 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 // buffer) when the range is split.
                 Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead>
                     scan_data(*gpu_memory, gpu_addr, scan_bytes, &astc_scan_buffer);
+                // The texture store first: its images are BC7 either way, and the hash is faster
+                // than the scan for opaque blocks. Without a store the runtime answers 0 at once.
+                // From PS5_Lichii (mihawk, codeberg.org/mihawk/PS5_Lichii),
+                // src/video_core/texture_cache/texture_cache.h.
+                if constexpr (requires {
+                                  runtime.FindStoredAstc(std::span<const u8>{}, new_info);
+                              }) {
+                    new_info.astc_store_key = runtime.FindStoredAstc(
+                        std::span<const u8>{scan_data.data(), scan_data.size()}, new_info);
+                }
                 new_info.astc_opaque =
+                    new_info.astc_store_key == 0 &&
                     AstcDataLooksOpaque(std::span<const u8>{scan_data.data(), scan_data.size()});
                 ++(new_info.astc_opaque ? astc_opaque_images : astc_alpha_images);
             }
@@ -4640,9 +4707,11 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
         True(src.flags & ImageFlagBits::UnwrittenSparse)) {
         return;
     }
-    if (dst.info.astc_opaque != src.info.astc_opaque) {
-        // BC1 and BC3 blocks differ in size, so the host can't copy between them; both hold the
-        // same guest data, which is uploaded from guest memory instead.
+    if (dst.info.astc_opaque != src.info.astc_opaque ||
+        (dst.info.astc_store_key != 0) != (src.info.astc_store_key != 0)) {
+        // BC1 and BC3 blocks differ in size, so the host can't copy between them, and a stored
+        // BC7 image's blocks mean nothing in BC3; both hold the same guest data, which is
+        // uploaded from guest memory (or the store) instead.
         return;
     }
     // As in BlitImage: land a parked deferred clear before the copy overwrites the image.

@@ -34,6 +34,17 @@ extern "C" {
 [[gnu::weak]] int LZ4_compress_default(const char* source, char* dest, int source_size, int max_dest_size);
 [[gnu::weak]] int LZ4_decompress_safe(const char* source, char* dest, int compressed_size, int max_decompressed_size);
 [[gnu::weak]] int LZ4_compressBound(int input_size);
+// zstd for the guest memory service's 64 KiB units (guest_memory_service.inc, "Units"): the core
+// links it; absent in the host checks that build this file alone.
+struct ZSTD_CCtx_s;
+struct ZSTD_DCtx_s;
+[[gnu::weak]] ZSTD_CCtx_s* ZSTD_createCCtx(void);
+[[gnu::weak]] ZSTD_DCtx_s* ZSTD_createDCtx(void);
+[[gnu::weak]] std::size_t ZSTD_compressCCtx(ZSTD_CCtx_s* context, void* to, std::size_t capacity, const void* from,
+                                            std::size_t size, int level);
+[[gnu::weak]] std::size_t ZSTD_decompressDCtx(ZSTD_DCtx_s* context, void* to, std::size_t capacity, const void* from,
+                                              std::size_t size);
+[[gnu::weak]] unsigned ZSTD_isError(std::size_t code);
 }
 namespace Common::Compression {
 [[gnu::weak]] std::vector<std::uint8_t> CompressDataLZ4(const std::uint8_t* source, std::size_t source_size);
@@ -1115,41 +1126,140 @@ std::size_t CommittedSplit() noexcept {
 // beginning when the cache is full. Taken whole, the four caches of a 64-bit game are 656 MiB of
 // the pool the CPU shares with the GPU, and a large game fills little more than half of that.
 // So a cache is address space only, in two ranges (the one the JIT writes through and the one
-// the code runs from), and memory is put behind both a step at a time as the JIT reaches it:
-// CommitCodeRange is asked before every block. Memory is not taken back while the cache lives.
+// the code runs from), and memory is put behind both as the JIT reaches it: CommitCodeRange is
+// asked before every block. Memory is not taken back while the cache lives, and a cache that
+// starts again at its beginning keeps what it has: the same cores compile the game's current
+// code into it at once (PS5_Lichii's caches keep theirs too).
+//
+// The memory comes one 2 MiB piece at a time, so a cache holds what its code takes and no more
+// than 2 MiB over it, and its size is only the most it may grow to: a Switch 2 title's cores
+// have 320 MiB each (Eglantine/src/core/arm/dynarmic/arm_dynarmic_64.cpp), as in PS5_Lichii,
+// whose caches are backed as code is written into them. It used to come in steps of 16 MiB,
+// two of them when the JIT was made.
 namespace {
-constexpr std::size_t CodeStep = std::size_t{16} << 20;
-constexpr std::size_t CodeSteps = 64; // the largest cache: 1 GiB
-// A step is taken as 2 MiB pieces, each where the pool has one: late in a long session the pool's
-// free memory is scattered (MKW without Pro memory: tens of MiB free, no 16 MiB run), and a step
-// asked for whole was refused and the app aborted.
-constexpr std::size_t CodePiece = LargePage, CodePieces = CodeStep / CodePiece;
+// EDEN_JIT_LAZY_CACHE=0 (env.txt) keeps the caches as they were before that: steps of 16 MiB,
+// every view where the system has room, three requests for memory back and no wait. The core
+// reads the same switch for the sizes of then.
+bool CodeByPiece() noexcept {
+    static const bool on = [] {
+        const char* const value = std::getenv("EDEN_JIT_LAZY_CACHE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+// Memory is taken as 2 MiB pieces whatever the step, each where the pool has one: late in a long
+// session the pool's free memory is scattered (MKW without Pro memory: tens of MiB free, no
+// 16 MiB run), and a step asked for whole was refused and the app aborted.
+constexpr std::size_t CodePiece = LargePage;
+constexpr std::size_t CodeStepBefore = std::size_t{16} << 20;
+constexpr std::size_t CodeSmallest = std::size_t{32} << 20; // a smaller cache is taken whole
+constexpr std::size_t CodeLargest = std::size_t{1} << 30;
+std::size_t CodeStep() noexcept {
+    return CodeByPiece() ? CodePiece : CodeStepBefore;
+}
 struct CodeRange {
     std::atomic<std::uintptr_t> executable{0}; // 0: free
     std::uintptr_t writable = 0;
     std::size_t span = 0;
     std::atomic<std::size_t> committed{0};
-    std::int64_t physical[CodeSteps * CodePieces] = {};
+    bool in_code_span = false; // its executable view is a part of code_span (below)
+    std::int64_t physical[CodeLargest / CodePiece] = {};
 };
-std::array<CodeRange, 16> code_ranges;
+// (More than two guest processes' worth: a cache that finds no entry is taken whole, and whole
+// is 320 MiB at once now.)
+std::array<CodeRange, 32> code_ranges;
 std::mutex code_mutex;
 std::atomic<std::size_t> code_reserved{0}, code_committed{0};
 
-// Memory behind the next step of both ranges. code_mutex is held.
-bool CommitCodeStep(CodeRange& range, std::size_t offset) {
+#ifdef PS5_NATIVE
+// One span of address space for the caches' executable views. Every core of a game runs the
+// blocks any core compiled, and a block reaches another with a 32-bit offset (the core's
+// jit_group.h): a link whose two ends are 2 GiB or more apart is left to the dispatcher. With
+// each view where the system had room the views alternated (written, run, written, run), six
+// caches spanned twice their sizes, and a Switch 2 title's had to stay under 1 GiB together
+// (they were 688 MiB). Side by side in a span just short of 2 GiB, six of 320 MiB are all in
+// reach of each other (PS5_Lichii keeps its six within 2 GiB of the title's code for its own
+// 32-bit calls, and found that 384 MiB each did not fit). The span is address space alone: made
+// with the first cache that wants it, given back with the last.
+constexpr std::size_t CodeSpan = (std::size_t{2} << 30) - (std::size_t{16} << 20);
+std::uintptr_t code_span = 0;  // (code_mutex, as the next)
+bool code_span_holed = false;  // a place in it is neither mapped nor reserved: see LeaveCodeSpan
+
+bool CodeSpanInUse() {
+    for (auto& range : code_ranges)
+        if (range.executable.load(std::memory_order_relaxed) != 0 && range.in_code_span) return true;
+    return false;
+}
+// The lowest place in the span that no cache has, for a view of `size` bytes. Null when there is
+// none, or no span: the view then goes where the system has room, as all did. code_mutex is held.
+void* TakeFromCodeSpan(std::size_t size) {
+    if (code_span_holed) return nullptr;
+    if (code_span == 0) {
+        void* base = reinterpret_cast<void*>(cpu_mapping_hint);
+        if (sceKernelReserveVirtualRange(&base, CodeSpan, 0, LargePage) != 0) return nullptr;
+        if (!cpu_mapping_range(base, CodeSpan)) {
+            (void)munmap(base, CodeSpan);
+            return nullptr;
+        }
+        code_span = reinterpret_cast<std::uintptr_t>(base);
+    }
+    std::uintptr_t at = code_span;
+    for (bool moved = true; moved;) {
+        moved = false;
+        for (auto& range : code_ranges) {
+            const std::uintptr_t begin = range.executable.load(std::memory_order_relaxed);
+            if (begin == 0 || !range.in_code_span || at >= begin + range.span || begin >= at + size) continue;
+            at = begin + range.span;
+            moved = true;
+        }
+    }
+    return at - code_span <= CodeSpan - size ? reinterpret_cast<void*>(at) : nullptr;
+}
+// The span goes once no cache runs from it. code_mutex is held.
+void ReleaseCodeSpan() {
+    if (code_span == 0 || code_span_holed || CodeSpanInUse()) return;
+    if (munmap(reinterpret_cast<void*>(code_span), CodeSpan) != 0) std::abort();
+    code_span = 0;
+}
+// A cache's executable view leaves the span, with memory behind its first `committed` bytes.
+// code_mutex is held, and the cache no longer counts as in the span.
+void LeaveCodeSpan(void* executable, std::size_t committed) {
+    if (!code_span_holed && !CodeSpanInUse()) {
+        ReleaseCodeSpan(); // the last one: the span goes whole, this cache's mappings with it
+        return;
+    }
+    // Other caches still run from the span, so this one's place stays address space, for the next
+    // cache: each piece reserved straight over its mapping (ReserveOver has why).
+    for (std::size_t offset = 0; offset < committed; offset += CodePiece) {
+        const int reserved = ReserveOver(static_cast<char*>(executable) + offset, CodePiece, LargePage);
+        if (reserved < 0) std::abort();
+        // Unmapped and not reserved: the system may give that place to any mapping, and a cache put
+        // there would map its code over it. No cache enters the span after that, and the span is
+        // never given back whole (that would unmap whatever landed in the hole).
+        if (reserved == 0) code_span_holed = true;
+    }
+}
+#endif
+
+// Memory behind the next `bytes` of both ranges, as 2 MiB pieces. code_mutex is held. `refused`:
+// the pool had no piece, nothing was mapped, and the same step may be asked for again.
+bool CommitCodeStep(CodeRange& range, std::size_t offset, std::size_t bytes, bool* refused) {
+    *refused = false;
     void* const writable = reinterpret_cast<void*>(range.writable + offset);
     void* const executable = reinterpret_cast<void*>(range.executable.load(std::memory_order_relaxed) + offset);
 #ifdef PS5_NATIVE
-    std::int64_t* const pieces = &range.physical[offset / CodeStep * CodePieces];
+    const std::size_t count = bytes / CodePiece;
+    std::int64_t* const pieces = &range.physical[offset / CodePiece];
     std::size_t taken = 0;
-    for (; taken < CodePieces; ++taken)
+    for (; taken < count; ++taken)
         if (eden_direct_low(CodePiece, LargePage, 12, &pieces[taken]) != 0) break;
-    if (taken < CodePieces) {
+    if (taken < count) {
         for (std::size_t piece = 0; piece < taken; ++piece) sceKernelReleaseDirectMemory(pieces[piece], CodePiece);
+        *refused = true;
         return false;
     }
     // A step that fails half way stays as it is: the caller has no cache to go on with.
-    for (std::size_t piece = 0; piece < CodePieces; ++piece) {
+    for (std::size_t piece = 0; piece < count; ++piece) {
         void* at = static_cast<char*>(writable) + piece * CodePiece;
         void* const want_writable = at;
         if (sceKernelMapDirectMemory(&at, CodePiece, PROT_READ | PROT_WRITE, MAP_FIXED, pieces[piece], LargePage) != 0 ||
@@ -1161,16 +1271,48 @@ bool CommitCodeStep(CodeRange& range, std::size_t offset) {
             at != want_executable)
             return false;
     }
-    std::memset(writable, 0, CodeStep);
+    std::memset(writable, 0, bytes);
     // As MapExecutableAlias: the mapping call refuses EXEC on some versions.
-    if (mprotect(executable, CodeStep, PROT_READ | PROT_EXEC) != 0) return false;
+    if (mprotect(executable, bytes, PROT_READ | PROT_EXEC) != 0) return false;
 #else
-    if (mprotect(writable, CodeStep, PROT_READ | PROT_WRITE) != 0 ||
-        mprotect(executable, CodeStep, PROT_READ | PROT_EXEC) != 0)
+    if (mprotect(writable, bytes, PROT_READ | PROT_WRITE) != 0 ||
+        mprotect(executable, bytes, PROT_READ | PROT_EXEC) != 0)
         return false;
 #endif
-    code_committed.fetch_add(CodeStep, std::memory_order_relaxed);
+    code_committed.fetch_add(bytes, std::memory_order_relaxed);
     return true;
+}
+
+// A cache's next 2 MiB piece. When the pool has none, memory is asked back and the piece asked
+// for again, for up to 2 s, as a table's commit does (CommitWithRecovery): a core that waits for
+// its next block is a stutter, and a JIT without memory for it is the end of the session. The
+// lock is let go while memory is asked back, so the other cores' caches grow meanwhile.
+bool CommitCodePiece(CodeRange& range, std::size_t offset) {
+    static std::atomic<std::size_t> asked{0};
+    bool refused = false;
+    {
+        const std::lock_guard lock{code_mutex};
+        if (CommitCodeStep(range, offset, CodePiece, &refused)) return true;
+    }
+    for (int tries = 0; refused && tries < 100; ++tries) {
+        if (eden_memory_recover_try(8 * CodePiece) == 0) {
+            const timespec pause{0, 20'000'000};
+            nanosleep(&pause, nullptr);
+        }
+        {
+            const std::lock_guard lock{code_mutex};
+            if (!CommitCodeStep(range, offset, CodePiece, &refused)) continue;
+        }
+        // (Said the 1st, 2nd, 4th, 8th ... time.)
+        if (const std::size_t count = asked.fetch_add(1, std::memory_order_relaxed) + 1; (count & (count - 1)) == 0) {
+            char line[128];
+            const int length = std::snprintf(line, sizeof(line),
+                "EDEN_JIT_MEMORY a piece found no memory and got it after asking (%zu so far, try %d)\n", count, tries + 1);
+            if (length > 0) Report(line);
+        }
+        return true;
+    }
+    return false;
 }
 } // namespace
 
@@ -1178,7 +1320,7 @@ bool CommitCodeStep(CodeRange& range, std::size_t offset) {
 // the one to run from. Null when a cache this small is better taken whole, or when the
 // platform refuses: the caller then takes the cache whole, as before.
 void* ReserveCodeRange(std::size_t size, void** executable) noexcept {
-    if (size < 2 * CodeStep || size % CodeStep != 0 || size / CodeStep > CodeSteps) return nullptr;
+    if (size < CodeSmallest || size % CodeStep() != 0 || size > CodeLargest) return nullptr;
     const std::lock_guard lock{code_mutex};
     CodeRange* free_range = nullptr;
     for (auto& range : code_ranges)
@@ -1188,11 +1330,17 @@ void* ReserveCodeRange(std::size_t size, void** executable) noexcept {
         }
     if (free_range == nullptr) return nullptr;
     void* views[2] = {nullptr, nullptr};
+    bool in_code_span = false;
 #ifdef PS5_NATIVE
     // Development A/B: dev-settings jit_memory=whole takes every cache whole, as before.
     if (DevSetting("jit_memory=whole")) return nullptr;
     (void)sceKernelEnableDmemAliasing(); // reports zero regardless; the first step is the check
+    if (CodeByPiece()) {
+        views[1] = TakeFromCodeSpan(size);
+        in_code_span = views[1] != nullptr;
+    }
     for (void*& view : views) {
+        if (view != nullptr) continue; // the executable view has its place in the span
         view = reinterpret_cast<void*>(cpu_mapping_hint);
         if (sceKernelReserveVirtualRange(&view, size, 0, LargePage) != 0) {
             view = nullptr;
@@ -1212,12 +1360,16 @@ void* ReserveCodeRange(std::size_t size, void** executable) noexcept {
     if (fd >= 0 && close(fd) != 0) std::abort();
 #endif
     if (views[0] == nullptr || views[1] == nullptr) {
-        for (void* view : views)
-            if (view != nullptr) (void)munmap(view, size);
+        if (views[0] != nullptr) (void)munmap(views[0], size);
+        if (views[1] != nullptr && !in_code_span) (void)munmap(views[1], size);
+#ifdef PS5_NATIVE
+        ReleaseCodeSpan(); // made for this cache alone: it goes with it
+#endif
         return nullptr;
     }
     free_range->writable = reinterpret_cast<std::uintptr_t>(views[0]);
     free_range->span = size;
+    free_range->in_code_span = in_code_span;
     free_range->committed.store(0, std::memory_order_relaxed);
     free_range->executable.store(reinterpret_cast<std::uintptr_t>(views[1]), std::memory_order_release);
     code_reserved.fetch_add(size, std::memory_order_relaxed);
@@ -1233,26 +1385,42 @@ bool CommitCodeRange(const void* executable, std::size_t bytes) noexcept {
     for (auto& range : code_ranges) {
         if (address == 0 || range.executable.load(std::memory_order_acquire) != address) continue;
         if (bytes > range.span) bytes = range.span;
-        if (bytes <= range.committed.load(std::memory_order_acquire)) return true;
-        const std::lock_guard lock{code_mutex};
-        std::size_t committed = range.committed.load(std::memory_order_relaxed);
-        while (committed < bytes) {
-            // Out of memory for the JIT's next 16 MiB: the guest memory service packs cold guest
-            // memory to give some back, and the step is asked for again (up to 3 times). Before, a
-            // refused step aborted the app (MKW without Pro memory, deep in a race).
-            bool stepped = CommitCodeStep(range, committed);
-            for (int attempt = 0; !stepped && attempt < 3; ++attempt) {
-                if (eden_memory_recover(CodeStep + (std::size_t{16} << 20)) == 0) break;
-                stepped = CommitCodeStep(range, committed);
+        const std::size_t before = range.committed.load(std::memory_order_acquire);
+        if (bytes <= before) return true;
+        std::size_t committed = before;
+        if (CodeByPiece()) {
+            // (A cache grows from its own core's thread, or from the one that compiles ahead for
+            // it while the core does not: never from two at once.)
+            while (committed < bytes) {
+                if (!CommitCodePiece(range, committed)) return false;
+                committed += CodePiece;
+                range.committed.store(committed, std::memory_order_release);
             }
-            if (!stepped) return false;
-            committed += CodeStep;
-            range.committed.store(committed, std::memory_order_release);
+        } else {
+            const std::lock_guard lock{code_mutex};
+            committed = range.committed.load(std::memory_order_relaxed);
+            while (committed < bytes) {
+                // Out of memory for the JIT's next 16 MiB: the guest memory service packs cold guest
+                // memory to give some back, and the step is asked for again (up to 3 times). Before, a
+                // refused step aborted the app (MKW without Pro memory, deep in a race).
+                bool refused = false;
+                bool stepped = CommitCodeStep(range, committed, CodeStepBefore, &refused);
+                for (int attempt = 0; !stepped && attempt < 3; ++attempt) {
+                    if (eden_memory_recover(CodeStepBefore + (std::size_t{16} << 20)) == 0) break;
+                    stepped = CommitCodeStep(range, committed, CodeStepBefore, &refused);
+                }
+                if (!stepped) return false;
+                committed += CodeStepBefore;
+                range.committed.store(committed, std::memory_order_release);
+            }
         }
-        char line[112];
-        const int length = std::snprintf(line, sizeof(line), "EDEN_JIT_MEMORY code=%p held=%zu of=%zu\n", executable,
-                                         committed, range.span);
-        if (length > 0) Report(line);
+        // (Said for every 16 MiB a cache has grown by, as it was for every step.)
+        if (before / CodeStepBefore != committed / CodeStepBefore || committed == range.span) {
+            char line[112];
+            const int length = std::snprintf(line, sizeof(line), "EDEN_JIT_MEMORY code=%p held=%zu of=%zu\n", executable,
+                                             committed, range.span);
+            if (length > 0) Report(line);
+        }
         return true;
     }
     return true;
@@ -1266,8 +1434,13 @@ bool FreeCodeRange(void* executable) noexcept {
     for (auto& range : code_ranges) {
         if (range.executable.load(std::memory_order_relaxed) != address) continue;
         const std::size_t committed = range.committed.load(std::memory_order_relaxed);
-        if (munmap(reinterpret_cast<void*>(range.writable), range.span) != 0 || munmap(executable, range.span) != 0)
-            std::abort();
+        const bool in_code_span = range.in_code_span;
+        range.in_code_span = false;
+        if (munmap(reinterpret_cast<void*>(range.writable), range.span) != 0) std::abort();
+#ifdef PS5_NATIVE
+        if (in_code_span) LeaveCodeSpan(executable, committed);
+#endif
+        if (!in_code_span && munmap(executable, range.span) != 0) std::abort();
 #ifdef PS5_NATIVE
         for (std::size_t piece = 0; piece < committed / CodePiece; ++piece)
             if (sceKernelReleaseDirectMemory(range.physical[piece], CodePiece) != 0) std::abort();
