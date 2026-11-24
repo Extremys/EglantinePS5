@@ -1343,8 +1343,10 @@ int main(int argc, char** argv) {
                     setenv("EDEN_CRAM_KEEP_GPU_MAPPED", "0", 0);
                     setenv("EDEN_CRAM_RESERVE_MIB", "128", 0);
                     setenv("EDEN_CRAM_UNPACK_KEEP_MIB", "64", 0);
-                    setenv("EDEN_NX2_TC_EXPECTED_MIB", "2048", 0);
-                    setenv("EDEN_NX2_TC_CRITICAL_MIB", "2560", 0);
+                    // Texture cache 1.5/2 GiB (2/2.5 before): in a 25-minute roam no allocation failed and
+                    // the frame rate was the same (33.5 FPS mean, 1 of 82 600-frame blocks under 30).
+                    setenv("EDEN_NX2_TC_EXPECTED_MIB", "1536", 0);
+                    setenv("EDEN_NX2_TC_CRITICAL_MIB", "2048", 0);
                     setenv("EDEN_CRAM_PACK_BELOW_MIB", "12288", 0); // pack from the start
                     // The driver gives a granule back once nothing has been bound to it for this long.
                     // With 2 s, 20 minutes into a session with 14 to 86 MiB free and memory asked back
