@@ -359,10 +359,34 @@ void PlaceSecondary(const char* name) {
         // keep the whole set (they may share the core with it).
         static std::atomic<bool> back_started{false};
         if (std::strcmp(name, "GPUBack") == 0) back_started.store(true, std::memory_order_relaxed);
-        static const unsigned long long forced_shared = [] {
+        static const unsigned long long forced_mask = [] {
             const char* value = std::getenv("EDEN_SECONDARY_MASK");
             return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
         }();
+        // (EglantinePS5) EDEN_PS5_ONE_CLUSTER=1 (read at each placement: a title sets it once it is
+        // known): on the console's usual layout (secondary CPUs 1caa: guest cores 0-3 on 0, 2, 4, 6,
+        // the GPU thread on 8, its back on 10), guest cores 4 and 5 stay on the first cluster's other
+        // CPUs (1, 3, 5, 7) and every other secondary thread goes to the second cluster's spare CPUs
+        // (9, 11, 12), so the six guest cores share one L3. Ocarina of Time standing in Kokiri
+        // Forest: 40.7 to 41.3 FPS against 38.3 to 38.8, interleaved.
+        const char* const one_cluster = std::getenv("EDEN_PS5_ONE_CLUSTER");
+        if (one_cluster != nullptr && one_cluster[0] == '1' && secondary_cpus == 0x1caaULL &&
+            PlacementOverride(name) == 0) {
+            const bool guest = std::strcmp(name, "CPUCore_4") == 0 || std::strcmp(name, "CPUCore_5") == 0;
+            const bool back = std::strcmp(name, "GPUBack") == 0;
+            if (!back) {
+                cpuset_t mask{};
+                const unsigned long long cpus_here = guest ? 0xaaULL : 0x1a00ULL;
+                for (unsigned cpu = 0; cpu < 64; ++cpu)
+                    if (cpus_here & (1ULL << cpu)) CPU_SET(cpu, &mask);
+                const int result = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &mask);
+                if (secondary_reports.fetch_add(1, std::memory_order_relaxed) < 64)
+                    std::fprintf(stderr, "EDEN_WORKER_PLACED name=%s mask=%llx error=%d one_cluster=1\n", name, cpus_here,
+                                 result ? errno : 0);
+                return;
+            }
+        }
+        const unsigned long long forced_shared = forced_mask;
         const unsigned long long shared =
             forced_shared != 0 ? forced_shared
             // The back's whole core is kept from the start. Kept only once the back existed, every

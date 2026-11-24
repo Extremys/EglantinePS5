@@ -1358,6 +1358,9 @@ int main(int argc, char** argv) {
                     // In 25-minute roams the frames of 0.5 to 1.2 s that came with each burst of writes
                     // after a failed allocation went (33.6 FPS mean, 1.3 GiB written).
                     setenv("EDEN_SWAP_KEEPER", "1", 0);
+                    // The six guest cores share one L3 cluster, the other threads use the second one
+                    // (performance.cpp, EDEN_PS5_ONE_CLUSTER): standing 6% faster.
+                    setenv("EDEN_PS5_ONE_CLUSTER", "1", 0);
                     // The keeper aims for 1 GiB free in 2 MiB pieces, not 512 MiB: with 512, 1 GiB of idle guest
                     // memory stayed in place while late in a session allocations failed and waited for writes
                     // (frames of 1.7 s); with 1024 a 25-minute roam had no failed allocation, worst frame 236 ms.
