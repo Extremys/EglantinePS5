@@ -138,7 +138,15 @@ enum class AcquireCheck {
 AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
     auto& split = VideoCommon::GpuSplit::Get();
     auto& stats = VideoCommon::g_acquire_stats;
-    if (!acquire.WaitsToReach()) {
+    // (EglantinePS5) Equal and mask acquires too, unless EDEN_NX2_ACQUIRE_ANY=0: with no release
+    // queued to the word that the back has yet to run, memory holds what the GPU reads there, and
+    // the last queued release decides as for greater-or-equal. Ocarina of Time drained 7,000
+    // equal or mask acquires a second, 87% of its drains.
+    static const bool any_operation = [] {
+        const char* const value = std::getenv("EDEN_NX2_ACQUIRE_ANY");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!acquire.WaitsToReach() && !any_operation) {
         VideoCommon::Count(stats.drain_operation);
         return AcquireCheck::Drain;
     }
