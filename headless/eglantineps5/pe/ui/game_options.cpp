@@ -132,7 +132,7 @@ std::vector<Option> options(int category, const GameSettings &game, Preferences 
                         pick(frames, prefs.frame_gen_target), locked});
         rows.push_back({tr("Frame gen multiplier"), multipliers, game.frame_gen_multiplier,
                         pick(multipliers, prefs.frame_gen_multiplier), locked});
-        const std::vector<std::string> types = {"AMD FSR 3", "Lossless Scaling"}; // product names
+        const std::vector<std::string> types = {"AMD FSR 3", "Lossless Scaling", "MihawkGen"}; // product names
         rows.push_back({tr("Frame gen type"), types, game.frame_gen_type, pick(types, prefs.frame_gen_type)});
         break;
     }

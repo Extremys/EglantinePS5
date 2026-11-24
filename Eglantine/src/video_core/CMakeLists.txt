@@ -390,6 +390,8 @@ if (ENABLE_LSFG)
         renderer_vulkan/present/frame_gen.h
         renderer_vulkan/present/fsr3_frame_gen.cpp
         renderer_vulkan/present/fsr3_frame_gen.h
+        renderer_vulkan/present/mihawk_frame_gen.cpp
+        renderer_vulkan/present/mihawk_frame_gen.h
         renderer_vulkan/present/frame_gen_pacer.cpp
         renderer_vulkan/present/frame_gen_pacer.h
         renderer_vulkan/present/lsfg_alpha.cpp
@@ -547,6 +549,25 @@ add_custom_command(
 target_sources(video_core PRIVATE "${lowering_stamp}")
 target_include_directories(video_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
+
+# MihawkGen (externals/mihawkgen): frame generation by a trained network (frame gen type "mihawk").
+# Its sources call Vulkan by name; they get the entry points as pointers from Eden's device
+# (eden/fg_vulkan_functions.h, force-included), and its weights are assembled in (fg_network.cpp).
+set(MIHAWKGEN_DIR "${PROJECT_SOURCE_DIR}/externals/mihawkgen")
+set(MIHAWKGEN_SOURCES
+    "${MIHAWKGEN_DIR}/src/fg_common.cpp"
+    "${MIHAWKGEN_DIR}/src/fg_neural.cpp"
+    "${MIHAWKGEN_DIR}/src/fg_splat.cpp"
+    "${MIHAWKGEN_DIR}/src/fg_vulkan.cpp"
+    "${MIHAWKGEN_DIR}/eden/fg_vulkan_functions.cpp")
+target_sources(video_core PRIVATE ${MIHAWKGEN_SOURCES} "${MIHAWKGEN_DIR}/eden/fg_network.cpp")
+set_source_files_properties(${MIHAWKGEN_SOURCES} PROPERTIES
+    COMPILE_DEFINITIONS VK_NO_PROTOTYPES
+    COMPILE_OPTIONS "-include;${MIHAWKGEN_DIR}/eden/fg_vulkan_functions.h;-Wno-error;-Wno-missing-field-initializers;-Wno-unused-parameter;-Wno-sign-compare;-Wno-shadow")
+set_source_files_properties("${MIHAWKGEN_DIR}/eden/fg_network.cpp" PROPERTIES
+    COMPILE_DEFINITIONS "FG_NETWORK_PATH=\"${MIHAWKGEN_DIR}/models/network.fgw\""
+    OBJECT_DEPENDS "${MIHAWKGEN_DIR}/models/network.fgw")
+target_include_directories(video_core PRIVATE "${MIHAWKGEN_DIR}/include" "${MIHAWKGEN_DIR}/src")
 if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)
 endif()

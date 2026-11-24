@@ -51,7 +51,7 @@ for dependencies, debugging tools, and the differences from the PS5 frontend.
 - **Resolution and upscaling** - render at 0.5x to 4x of the game's resolution and choose the filter that scales it to your TV (Bilinear, AMD FSR, Bicubic or Nearest) in **Settings > Video**.
 - **Output resolution** - the picture is made at 1080p, 1440p or 2160p: **Output resolution** in **Settings > Video**. The menu is drawn at that size too, and the PS5 scales it to your TV.
 - **120 Hz output** - on a display that shows 120 Hz, games can run on a 120 Hz output: **Refresh rate** in **Settings > Video**, or in one game's settings. A frame that is a little late is then shown 8 ms later instead of 17 ms, and patches for more than 60 FPS need it. The menu stays at 60 Hz.
-- **Frame generation** - between two of a game's own pictures EglantinePS5 can show one made up from them, so a 30 FPS game looks like 60: **Frame generation** in **Settings > Video**, or in one game's settings. It needs your own copy of Lossless Scaling; see [Frame generation](#frame-generation).
+- **Frame generation** - between two of a game's own pictures EglantinePS5 can show one made up from them, so a 30 FPS game looks like 60: on by default, with [PS5_MihawkGen](https://github.com/mihawk-99/PS5_MihawkGen)'s network: **Frame generation** in **Settings > Video**, or in one game's settings. See [Frame generation](#frame-generation).
 - **Game files anywhere** - keys, firmware, and games can live in any folder the PS5 can read: internal storage, an M.2 or external drive, or a USB device.
 - **Folder browser** - pick the game files folder in **Settings > Game files**. It shows how many keys, firmware files, and games each folder holds. Hold L1/R1 to page quickly.
 - **Library** - game covers, **Continue Playing**, and **Recently Played**, which keep working after you move your files.
@@ -324,17 +324,20 @@ Deleting `cache/swap/` while no game runs is always safe.
 
 Frame generation shows, between two pictures a game draws, one that is made up from them. A game that runs at 30 FPS then looks like 60. It does not make the game itself faster, it adds a little delay between a button and its effect, and fast motion can show faults in the made-up pictures. It works with the Vulkan renderer.
 
-It uses the frame generation of [Lossless Scaling](https://store.steampowered.com/app/993090/Lossless_Scaling/), which EglantinePS5 cannot include: you need your own copy of that program.
+It is **on by default**, made by **MihawkGen**: the trained network of [PS5_MihawkGen](https://github.com/mihawk-99/PS5_MihawkGen) (the one Longshot uses on the PS5), built in. It works from the two pictures alone, so it needs nothing from you and nothing from the game. Settings saved by an earlier version switch to it, on, once (a Lossless Scaling choice is kept); a game's own setting still wins, and **Frame generation** off in **Settings > Video** or in a game's settings turns it off.
+
+**Frame gen type** picks what makes the pictures: **MihawkGen** (the default), **AMD FSR 3** (EglantinePS5's own approximation of it) or **Lossless Scaling**. Lossless Scaling's cannot be included: it needs your own copy of that program.
 
 1. On the PC where Lossless Scaling is installed, find `Lossless.dll` in its folder (with Steam: `steamapps/common/Lossless Scaling`).
 2. Copy it to the console as `/data/eglantineps5/user/lossless/Lossless.dll`.
 3. Set **Frame generation** to on in **Settings > Video**, or for one game: Triangle on the game in the Library, then **Video**. It applies the next time the game starts.
 
-Without the file, the three settings are greyed out and say **Unavailable**.
+Without the file, Lossless Scaling's settings are greyed out and say **Unavailable**.
 
 | Setting | What it does |
 |---|---|
-| Frame generation | On or off |
+| Frame generation | On (default) or off |
+| Frame gen type | MihawkGen (default), AMD FSR 3 or Lossless Scaling |
 | Frame gen target | The rate to reach: as many pictures are added as it takes. **60 Hz** suits a 30 FPS game on the usual output; more than 60 needs **Refresh rate** at 120 Hz and a display that shows it. **Auto** leaves it to the multiplier |
 | Frame gen multiplier | With the target on Auto: 2x, 3x or 4x the game's own pictures |
 

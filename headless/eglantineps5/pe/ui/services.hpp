@@ -305,8 +305,8 @@ struct Preferences
     int output = 0;  // the size of the picture, menu and games: 0 1080p, 1 1440p, 2 2160p
     // Frame generation (Vulkan only): between a game's own frames, show frames generated from
     // them, up to the output's rate.
-    bool frame_gen = false;
-    int frame_gen_type = 0;        // index into kFrameGenTypeKeys: 0 AMD FSR 3, 1 Lossless Scaling
+    bool frame_gen = true;
+    int frame_gen_type = 2;        // index into kFrameGenTypeKeys: 0 AMD FSR 3, 1 Lossless Scaling, 2 MihawkGen (default)
     int frame_gen_target = 0;      // index into kFrameGenTargetKeys: 0 auto, then 60/90/120/144/240
     int frame_gen_multiplier = 0;  // index into kFrameGenMultiplierKeys: 2x, 3x, 4x
     bool vibration = true;

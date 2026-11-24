@@ -52,6 +52,11 @@ builds on the following projects, each under its own license.
 
 ## Graphics
 
+- **[PS5_MihawkGen](https://github.com/mihawk-99/PS5_MihawkGen)** (c57232a),
+  GPL-3.0-or-later. Its frame generator (`framegen/`: interface, compute
+  shaders as SPIR-V, and the trained network `network.fgw`) is in
+  `Eglantine/externals/mihawkgen`, used by the "MihawkGen" frame generation
+  type; `eden/` there is ours (Vulkan entry points and the network's embedding).
 - **[ProsperoEden](https://github.com/blackbearreloaded/ProsperoEden)**,
   GPL-3.0-or-later. The shared pipeline-build wait implementation
   (`headless/striped_wait.h`) and elevated-console disk-cache policy were

@@ -134,8 +134,8 @@ const char *output_name(int output)
 
 constexpr const char *kFrameGenTargetNames[] = {"", "60", "90", "120", "144", "240"};
 constexpr const char *kFrameGenMultiplierNames[] = {"2x", "3x", "4x"};
-constexpr const char *kFrameGenTypeNames[] = {"AMD FSR 3", "Lossless Scaling"}; // product names
-constexpr int kFrameGenTypes = 2;
+constexpr const char *kFrameGenTypeNames[] = {"AMD FSR 3", "Lossless Scaling", "MihawkGen"}; // product names
+constexpr int kFrameGenTypes = 3;
 constexpr int kFrameGenTypeLossless = 1;
 
 const char *on_off(bool value)
