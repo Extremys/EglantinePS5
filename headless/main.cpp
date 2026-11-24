@@ -1331,6 +1331,11 @@ int main(int argc, char** argv) {
                     setenv("EDEN_NX2_TC_EXPECTED_MIB", "2048", 0);
                     setenv("EDEN_NX2_TC_CRITICAL_MIB", "2560", 0);
                     setenv("EDEN_CRAM_PACK_BELOW_MIB", "12288", 0); // pack from the start
+                    // Slots the GPU's caches map are split into 64 KiB units like the rest: they hold 3.2 GB of
+                    // the game's 4.1 GB, and kept whole they left the pool full after 12 to 16 minutes in Kokiri
+                    // Forest (VK_ERROR_OUT_OF_DEVICE_MEMORY). Split, the game holds 2.9 to 3.0 GB and a 25-minute
+                    // session had no allocation refused. EDEN_CRAM_SPLIT_GPU=0 keeps them whole.
+                    setenv("EDEN_CRAM_SPLIT_GPU", "1", 0);
                 } else if (fallback_ours && eden_game_title_id(guest) != 0x0400486024DEC000ULL) {
                     unsetenv("EDEN_NX2_FORCE_MESH_FALLBACK");
                     fallback_ours = false;
