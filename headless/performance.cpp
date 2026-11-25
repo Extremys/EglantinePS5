@@ -376,7 +376,10 @@ void PlaceSecondary(const char* name) {
             const bool back = std::strcmp(name, "GPUBack") == 0;
             if (!back) {
                 cpuset_t mask{};
-                const unsigned long long cpus_here = guest ? 0xaaULL : 0x1a00ULL;
+                // EDEN_PS5_GUEST45_MASK and EDEN_SECONDARY_MASK (hex) replace the two sets for experiments.
+                const char* const guest_mask = std::getenv("EDEN_PS5_GUEST45_MASK");
+                const unsigned long long guest_cpus = guest_mask ? std::strtoull(guest_mask, nullptr, 16) : 0xaaULL;
+                const unsigned long long cpus_here = guest ? guest_cpus : (forced_mask ? forced_mask : 0x1a00ULL);
                 for (unsigned cpu = 0; cpu < 64; ++cpu)
                     if (cpus_here & (1ULL << cpu)) CPU_SET(cpu, &mask);
                 const int result = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &mask);
