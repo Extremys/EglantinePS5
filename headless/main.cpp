@@ -1361,6 +1361,12 @@ int main(int argc, char** argv) {
                     // The six guest cores share one L3 cluster, the other threads use the second one
                     // (performance.cpp, EDEN_PS5_ONE_CLUSTER): standing 6% faster.
                     setenv("EDEN_PS5_ONE_CLUSTER", "1", 0);
+                    // Draws wait for a pipeline still building instead of being skipped (vk_pipeline_cache.cpp,
+                    // EDEN_NX2_ASYNC_DRAWS_WAIT): with no pipeline cache yet, a skipped draw left the GPU on a
+                    // submission that never completed as gameplay started (6 of 6 on a tester's console, and
+                    // here with the caches moved away); waiting costs one stall of about 16 s while the first
+                    // scene's pipelines build, and nothing once they are in the cache.
+                    setenv("EDEN_NX2_ASYNC_DRAWS_WAIT", "w", 0);
                     // The keeper aims for 1 GiB free in 2 MiB pieces, not 512 MiB: with 512, 1 GiB of idle guest
                     // memory stayed in place while late in a session allocations failed and waited for writes
                     // (frames of 1.7 s); with 1024 a 25-minute roam had no failed allocation, worst frame 236 ms.

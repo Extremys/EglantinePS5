@@ -2314,6 +2314,15 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
     if (!use_asynchronous_shaders) {
         return pipeline;
     }
+    // (EglantinePS5) EDEN_NX2_ASYNC_DRAWS_WAIT: 1, every draw waits for its pipeline (which the
+    // workers still build in parallel); w, only draws that write memory besides their render
+    // targets wait (GraphicsPipeline::WritesMemory), the others are skipped while they build.
+    // Read at each unbuilt pipeline: a title sets it once it is known, after the launcher's own.
+    if (const char* const wait = std::getenv("EDEN_NX2_ASYNC_DRAWS_WAIT")) {
+        if (wait[0] == '1' || (wait[0] == 'w' && pipeline->WritesMemory())) {
+            return pipeline;
+        }
+    }
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     const NativePendingMode mode = native ? NativeMode() : NativePendingMode::Wait;
