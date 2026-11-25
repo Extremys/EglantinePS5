@@ -20,6 +20,7 @@
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/hle/kernel/thread_startup_policy.h"
 
 namespace Kernel::Svc {
@@ -189,7 +190,24 @@ void SleepThread(Core::System& system, s64 ns) {
 
         // Sleep.
         // NOTE: Nintendo does not check the result of this sleep.
-        static_cast<void>(GetCurrentThread(kernel).Sleep(kernel, timeout));
+        if (!Nx2ThreadStats::g_enabled()) {
+            static_cast<void>(GetCurrentThread(kernel).Sleep(kernel, timeout));
+        } else {
+            // EDEN_NX2_GUEST_THREAD_STATS: asked against slept, every 10 s.
+            static std::atomic<u64> count{}, asked{}, slept{}, under100{}, next{};
+            const auto start = std::chrono::steady_clock::now();
+            static_cast<void>(GetCurrentThread(kernel).Sleep(kernel, timeout));
+            const auto now = std::chrono::steady_clock::now();
+            const u64 took = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+            count.fetch_add(1); asked.fetch_add(u64(ns)); slept.fetch_add(took);
+            if (ns < 100'000) under100.fetch_add(1);
+            const u64 at = u64(now.time_since_epoch().count());
+            if (u64 due = next.load(); at >= due && next.compare_exchange_strong(due, at + 10'000'000'000ULL) && due != 0) {
+                const u64 n = count.exchange(0), a = asked.exchange(0), t = slept.exchange(0), u = under100.exchange(0);
+                LOG_INFO(Kernel_SVC, "SleepThread over 10 s: {} sleeps ({} under 100 us), asked {} us, slept {} us",
+                         n, u, a / 1000, t / 1000);
+            }
+        }
     } else if (yield_type == Svc::YieldType::WithoutCoreMigration) {
         KScheduler::YieldWithoutCoreMigration(kernel);
     } else if (yield_type == Svc::YieldType::WithCoreMigration) {

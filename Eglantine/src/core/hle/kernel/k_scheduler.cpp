@@ -355,7 +355,7 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
         cur_process->AddCpuTime(tick_diff);
     }
     m_last_context_switch_time = cur_tick;
-    if (Nx2ThreadStats::g_enabled) {
+    if (Nx2ThreadStats::g_enabled()) {
         Nx2ThreadStats::OnSwitch(cur_thread, next_thread, cur_tick, tick_diff);
     }
 
@@ -533,7 +533,7 @@ void KScheduler::OnThreadStateChanged(KernelCore& kernel, KThread* thread, Threa
     ASSERT(IsSchedulerLockedByCurrentThread(kernel));
     // Check if the state has changed, because if it hasn't there's nothing to do.
     if (const ThreadState cur_state = thread->GetRawState(); cur_state != old_state) {
-        if (Nx2ThreadStats::g_enabled) {
+        if (Nx2ThreadStats::g_enabled()) {
             Nx2ThreadStats::OnStateChanged(
                 thread, kernel.System().CoreTiming().GetClockTicks(),
                 (old_state & ThreadState::Mask) == ThreadState::Waiting,

@@ -16,9 +16,11 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/debugger/debugger.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/kernel/svc.h"
@@ -114,7 +116,22 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
                     thread->SetStepState(StepState::StepPerformed);
                 }
             } else {
+                // EDEN_NX2_GUEST_THREAD_STATS: the Run()'s time and exit, per guest thread and core.
+                const bool stats = Nx2ThreadStats::g_enabled();
+                u64 start = 0;
+                if (stats) {
+                    Nx2ThreadStats::BeginRun();
+                    start = system.CoreTiming().GetClockTicks();
+                }
                 hr = interface->RunThread(thread);
+                if (stats) {
+                    const bool svc = True(hr & Core::HaltReason::SupervisorCall);
+                    Nx2ThreadStats::EndRun(thread, m_core_index, start, system.CoreTiming().GetClockTicks(),
+                                           svc ? Nx2ThreadStats::Exit::Svc
+                                           : True(hr & Core::HaltReason::BreakLoop) ? Nx2ThreadStats::Exit::Interrupt
+                                                                                   : Nx2ThreadStats::Exit::Other,
+                                           svc ? interface->GetSvcNumber() : 0, 0, 0, 0);
+                }
             }
 
             ExitContext();

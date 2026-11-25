@@ -1822,7 +1822,7 @@ private:
     void PresentClientBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
-        if (Kernel::Nx2ThreadStats::g_enabled) {
+        if (Kernel::Nx2ThreadStats::g_enabled()) {
             Kernel::Nx2ThreadStats::OnPresent(&ctx.GetThread());
         }
         if (Common::DkbFrameTrace::Enabled()) {

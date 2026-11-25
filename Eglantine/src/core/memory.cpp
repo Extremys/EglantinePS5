@@ -1032,7 +1032,7 @@ struct Memory::Impl {
     }
 
     void HandleRasterizerDownload(VAddr v_address, size_t size) {
-        if (!Kernel::Nx2ThreadStats::g_enabled) {
+        if (!Kernel::Nx2ThreadStats::g_enabled()) {
             DownloadFromRasterizer(v_address, size);
             return;
         }
@@ -1087,7 +1087,7 @@ struct Memory::Impl {
     }
 
     void HandleRasterizerWrite(VAddr v_address, size_t size) {
-        if (!Kernel::Nx2ThreadStats::g_enabled) {
+        if (!Kernel::Nx2ThreadStats::g_enabled()) {
             WriteToRasterizer(v_address, size);
             return;
         }
