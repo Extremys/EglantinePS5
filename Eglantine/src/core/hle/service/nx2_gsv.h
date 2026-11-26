@@ -45,6 +45,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/nx2_thread_stats.h"
+#include "core/hle/kernel/sched_trace.h"
 #include "core/hle/kernel/k_system_resource.h"
 #include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_page_group.h"
@@ -1822,6 +1823,7 @@ private:
     void PresentClientBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
+        Kernel::SchedTrace::Add(3, 0, u32(ctx.GetThread().GetThreadId()), 0);
         if (Kernel::Nx2ThreadStats::g_enabled()) {
             Kernel::Nx2ThreadStats::OnPresent(&ctx.GetThread());
         }

@@ -208,6 +208,16 @@ void SleepThread(Core::System& system, s64 ns) {
                          n, u, a / 1000, t / 1000);
             }
         }
+    } else if (Nx2ThreadStats::g_enabled() && [&] {
+                   static std::atomic<u64> kinds[3]{}, next{};
+                   kinds[ns == 0 ? 0 : ns == -1 ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+                   const u64 at = u64(std::chrono::steady_clock::now().time_since_epoch().count());
+                   if (u64 due = next.load(); at >= due && next.compare_exchange_strong(due, at + 10'000'000'000ULL) && due != 0) {
+                       LOG_INFO(Kernel_SVC, "Yields over 10 s: {} without migration, {} with, {} to any thread",
+                                kinds[0].exchange(0), kinds[1].exchange(0), kinds[2].exchange(0));
+                   }
+                   return false;
+               }()) {
     } else if (yield_type == Svc::YieldType::WithoutCoreMigration) {
         KScheduler::YieldWithoutCoreMigration(kernel);
     } else if (yield_type == Svc::YieldType::WithCoreMigration) {

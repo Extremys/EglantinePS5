@@ -44,6 +44,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/memory.h"
+#include "core/causal_delay.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
@@ -1032,6 +1033,9 @@ struct Memory::Impl {
     }
 
     void HandleRasterizerDownload(VAddr v_address, size_t size) {
+        if (Core::Causal::CachedReadNs() && system.GetCurrentHostThreadID() < Core::Hardware::NUM_CPU_CORES) {
+            Core::Causal::Spin(Core::Causal::CachedReadNs());
+        }
         if (!Kernel::Nx2ThreadStats::g_enabled()) {
             DownloadFromRasterizer(v_address, size);
             return;
@@ -1087,6 +1091,9 @@ struct Memory::Impl {
     }
 
     void HandleRasterizerWrite(VAddr v_address, size_t size) {
+        if (Core::Causal::CachedNs() && system.GetCurrentHostThreadID() < Core::Hardware::NUM_CPU_CORES) {
+            Core::Causal::Spin(Core::Causal::CachedNs());
+        }
         if (!Kernel::Nx2ThreadStats::g_enabled()) {
             WriteToRasterizer(v_address, size);
             return;
