@@ -1,8 +1,12 @@
 // The fastmem fault callback without code writes (headless/dynarmic/fastmem-callback.cmake),
 // in the A64 unit (EDEN_FASTMEM_A64_UNIT): the A32 unit keeps upstream's code.
 #ifdef EDEN_FASTMEM_A64_UNIT
-extern "C" bool eden_jit_invalidate_running(unsigned long long pc) __attribute__((weak));  // jit_impl.inc
+extern "C" bool eden_jit_invalidate_running(unsigned long long pc, unsigned long long location) __attribute__((weak));  // jit_impl.inc
 inline std::atomic<unsigned long long> eden_fastmem_demotions{0};
+inline std::atomic<unsigned long long> eden_fastmem_repeats{0};  // faults at sites already demoted
+extern "C" unsigned long long eden_fastmem_repeat_count() { return eden_fastmem_repeats.load(std::memory_order_relaxed); }
+// Read by the fastmem window report (src/host_memory.cpp).
+extern "C" unsigned long long eden_fastmem_demotion_count() { return eden_fastmem_demotions.load(std::memory_order_relaxed); }
 namespace {
 std::mutex& EdenFastmemSiteMutex() {
     static std::mutex mutex;
@@ -171,11 +175,23 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
             // No code is written here (headless/dynarmic/fastmem-callback.cmake).
             const DoNotFastmemMarker marker{iter->location, static_cast<unsigned>(iter->inst_name)};
             do_not_fastmem.insert(marker);
-            EdenFastmemDemoted().insert({IR::LocationDescriptor{std::get<0>(marker)}.Value(), static_cast<u32>(std::get<1>(marker))});
+            const bool first = EdenFastmemDemoted().insert({IR::LocationDescriptor{std::get<0>(marker)}.Value(), static_cast<u32>(std::get<1>(marker))}).second;
             eden_lock.unlock();
             eden_fastmem_demotions.fetch_add(1, std::memory_order_relaxed);
+            if (!first) {
+                const auto n = eden_fastmem_repeats.fetch_add(1, std::memory_order_relaxed);
+                // EDEN_FASTMEM_REPEAT_LOG=1: the first repeats, to find what still runs a demoted block.
+                static const bool log_repeats = std::getenv("EDEN_FASTMEM_REPEAT_LOG") != nullptr;
+                if (log_repeats && (n < 40 || n % 200000 == 0))
+                    std::fprintf(stderr, "EDEN_FASTMEM_REPEAT n=%llu rip=%llx base=%llx off=%llx location=%llx pc=%llx inst=%u\n",
+                                 static_cast<unsigned long long>(n), static_cast<unsigned long long>(rip_),
+                                 static_cast<unsigned long long>(base), static_cast<unsigned long long>(rip_ - base),
+                                 static_cast<unsigned long long>(IR::LocationDescriptor{std::get<0>(marker)}.Value()),
+                                 static_cast<unsigned long long>(EdenFastmemSitePC(jit_interface, std::get<0>(marker))),
+                                 static_cast<unsigned>(std::get<1>(marker)));
+            }
             const u64 pc = EdenFastmemSitePC(jit_interface, std::get<0>(marker));
-            if (!eden_jit_invalidate_running || !eden_jit_invalidate_running(pc))
+            if (!eden_jit_invalidate_running || !eden_jit_invalidate_running(pc, IR::LocationDescriptor{std::get<0>(marker)}.Value()))
                 jit_interface->InvalidateCacheRange(pc, 4);
 #endif
         }
