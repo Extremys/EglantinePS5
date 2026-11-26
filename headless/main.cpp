@@ -76,6 +76,7 @@ extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
 #include "../src/fastmem.h"
 // The 64-bit fastmem window's demoted sites, kept per title (headless/dynarmic/fastmem-callback.cmake).
 extern "C" std::size_t eden_fastmem64_load_sites(const char*, unsigned long long, const unsigned char*) __attribute__((weak));
+extern "C" unsigned long long eden_fastmem_demotion_count() __attribute__((weak));
 extern "C" std::size_t eden_fastmem64_save_sites(const char*, unsigned long long, unsigned long long,
                                                  const unsigned char*) __attribute__((weak));
 #include "crash_report.h"
@@ -1855,6 +1856,9 @@ int main(int argc, char** argv) {
                 [[maybe_unused]] std::string fastmem64_sites;  // the title's demoted 64-bit fastmem sites (cache/jit)
                 [[maybe_unused]] u64 fastmem64_code_start = 0, fastmem64_code_size = 0;
                 [[maybe_unused]] unsigned char fastmem64_build[32]{};
+                // Saves the demoted sites every minute while new ones appear, so a session that ends
+                // without the menu (a crash, the console turned off) still gives the next one a warm window.
+                [[maybe_unused]] std::jthread fastmem64_saver;
                 if (auto* process = system.ApplicationProcess()) {
                     Eden::JitList::BuildId build{};
                     const auto& id = system.GetApplicationProcessBuildID();
@@ -1885,6 +1889,19 @@ int main(int argc, char** argv) {
                         std::memcpy(fastmem64_build, build.data(), std::min(sizeof(fastmem64_build), build.size()));
                         std::printf("EDEN_FASTMEM64 sites_loaded=%zu\n",
                                     eden_fastmem64_load_sites(fastmem64_sites.c_str(), fastmem64_code_start, fastmem64_build));
+                        if (eden_fastmem64_save_sites)
+                            fastmem64_saver = std::jthread([&](std::stop_token stop) {
+                                unsigned long long saved = eden_fastmem_demotion_count ? eden_fastmem_demotion_count() : 0;
+                                while (!stop.stop_requested()) {
+                                    for (int second = 0; second < 60 && !stop.stop_requested(); ++second)
+                                        std::this_thread::sleep_for(std::chrono::seconds{1});
+                                    const unsigned long long now = eden_fastmem_demotion_count ? eden_fastmem_demotion_count() : 0;
+                                    if (stop.stop_requested() || now == saved) continue;
+                                    saved = now;
+                                    eden_fastmem64_save_sites(fastmem64_sites.c_str(), fastmem64_code_start,
+                                                              fastmem64_code_size, fastmem64_build);
+                                }
+                            });
                     }
 #endif
                 }
@@ -2290,6 +2307,10 @@ int main(int argc, char** argv) {
                 Eden::StopLimit::Begin();
                 jit_list.Finish();  // while the JITs still exist: their block list is saved
 #ifdef PS5_NATIVE
+                if (fastmem64_saver.joinable()) {
+                    fastmem64_saver.request_stop();
+                    fastmem64_saver.join();
+                }
                 if (!fastmem64_sites.empty() && eden_fastmem64_save_sites)
                     std::printf("EDEN_FASTMEM64 sites_saved=%zu\n",
                                 eden_fastmem64_save_sites(fastmem64_sites.c_str(), fastmem64_code_start,

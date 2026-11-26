@@ -64,9 +64,14 @@ extern "C" std::size_t eden_fastmem64_save_sites(const char* path, unsigned long
     if (!file) return 0;
     std::size_t written = 0;
     bool ok = std::fwrite("EF66", 1, 4, file) == 4 && std::fwrite(build, 1, 32, file) == 32;
+    // Copied under the lock and written after it: fault handlers take the same lock.
+    std::vector<std::pair<u64, u32>> sites;
     {
         std::lock_guard lock{EdenFastmemSiteMutex()};
-        for (const auto& [location, inst] : EdenFastmemDemoted()) {
+        sites.assign(EdenFastmemDemoted().begin(), EdenFastmemDemoted().end());
+    }
+    {
+        for (const auto& [location, inst] : sites) {
             const u64 pc = A64::LocationDescriptor{IR::LocationDescriptor{location}}.PC();
             if (!ok || pc < code_start || pc - code_start >= code_size) continue;
             const u64 offset = location - code_start;
