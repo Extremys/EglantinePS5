@@ -203,7 +203,14 @@ void BufferCache<P>::TickFrame() {
         RunGarbageCollector(total_used_memory >= critical_memory);
     }
     ++frame_tick;
-    delayed_destruction_ring.Tick();
+    while (!retired_buffers.empty() && frame_tick - retired_buffers.front().frame >= TICKS_TO_DESTROY) {
+        if constexpr (requires { runtime.IsFree(u64{}); }) {
+            if (!runtime.IsFree(retired_buffers.front().tick)) {
+                break;
+            }
+        }
+        retired_buffers.pop_front();
+    }
 
     // Pages draws wrote: their early downloads, now that the frame's work is recorded.
     RecordEarlyDownloads();
@@ -3123,7 +3130,7 @@ void BufferCache<P>::UpdateIndexBuffer() {
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
             ++buffer_deletions;
             // Draws recorded but not yet submitted may still read the old one.
-            delayed_destruction_ring.Push(std::move(slot_buffers[inline_buffer_id]));
+            RetireBuffer(std::move(slot_buffers[inline_buffer_id]));
             slot_buffers.erase(inline_buffer_id);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
@@ -4264,6 +4271,15 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 }
 
 template <class P>
+void BufferCache<P>::RetireBuffer(Buffer&& buffer) {
+    u64 tick = 0;
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        tick = runtime.CurrentTick();
+    }
+    retired_buffers.push_back({frame_tick, tick, std::move(buffer)});
+}
+
+template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     const StutterTrace::SiteScope site{StutterTrace::Site::BufferDelete};
     ++buffer_deletions;
@@ -4318,7 +4334,7 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
 #ifdef YUZU_LEGACY
     if (!do_not_mark || !immediately_free)
 #endif
-        delayed_destruction_ring.Push(std::move(slot_buffers[buffer_id]));
+        RetireBuffer(std::move(slot_buffers[buffer_id]));
 
     slot_buffers.erase(buffer_id);
 
