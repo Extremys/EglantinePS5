@@ -797,6 +797,10 @@ int main(int argc, char** argv) {
         const uint64_t game_title = 0;
 #endif
         Eden::session_title.store(game_title);
+        // Ocarina of Time takes the 64-bit fastmem window unless EDEN_FASTMEM64 says otherwise:
+        // standing in Kokiri Forest 45-47 FPS against ~41 through the page table.
+        if (!std::getenv("EDEN_FASTMEM64"))
+            Eden::Fastmem::RequestA64(game_title == 0x0400486024DEC000ULL);
         const unsigned cycles = game ? 1 : 3;
         const bool devices = EDEN_DEVICE_FRONTEND;
         if (game) {
