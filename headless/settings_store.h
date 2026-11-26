@@ -719,6 +719,9 @@ inline PerformanceSettings LoadPerformance(uint64_t title_id, const std::string&
         result.fast_gpu = true;
         result.reactive_flushing = false;
     }
+    // Ocarina of Time: dynarmic's inexact floating point by default, +2.5-3% FPS standing and
+    // +5% over a 25-minute roam with nothing seen wrong. Its Library switch still turns it off.
+    if (title_id == 0x0400486024DEC000ULL) result.unsafe_cpu = true;
     if (title_id) read("/games/" + Settings::TitleKey(title_id));
     return result;
 }

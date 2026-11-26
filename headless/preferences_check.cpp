@@ -415,6 +415,7 @@ int main() {
     speed = Eden::LoadPerformance(quest, file);  // another title keeps the general values
     assert(speed.block_list && speed.async_shaders && !speed.fast_gpu && !speed.unsafe_cpu && !speed.unsafe_dma);
     assert(Eden::LoadPerformance(0, file).async_shaders);
+    assert(Eden::LoadPerformance(0x0400486024DEC000ULL, file).unsafe_cpu);  // Ocarina's own default
     assert(Eden::LoadGameSettings(racer, file).resolution == 4);  // the title's other settings stay
     // A file written by hand: a title names one value, the rest are the general ones; a value of
     // the wrong type reads as if it were absent.
