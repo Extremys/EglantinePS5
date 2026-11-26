@@ -3122,6 +3122,8 @@ void BufferCache<P>::UpdateIndexBuffer() {
         }
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
             ++buffer_deletions;
+            // Draws recorded but not yet submitted may still read the old one.
+            delayed_destruction_ring.Push(std::move(slot_buffers[inline_buffer_id]));
             slot_buffers.erase(inline_buffer_id);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
