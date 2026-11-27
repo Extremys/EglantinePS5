@@ -11,7 +11,9 @@
 // SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <unordered_map>
 #include <algorithm>
@@ -62,6 +64,65 @@ static inline bool AddressSpaceContains(const Common::PageTable& table, const Co
     const Common::ProcessAddress max_addr = 1ULL << table.GetAddressSpaceBits();
     return addr + size >= addr && addr + size <= max_addr;
 }
+
+// Pages armed for read traps, one bit each in 16 MiB chunks. A std::set<u64> took a tree node
+// (and a malloc) per 4 KiB page: arming a render target walked thousands of them, about 10% of
+// the GPU back thread in Ocarina of Time's heavy areas. Chunks stay once made (512 bytes each).
+class ArmedPages {
+public:
+    bool Set(u64 page) {
+        u64& word = Chunk(page)[(page >> 6) & 63];
+        const u64 bit = 1ULL << (page & 63);
+        const bool added = (word & bit) == 0;
+        word |= bit;
+        return added;
+    }
+    // Calls f(page) for each armed page in [begin, end), in order; f returns false to stop.
+    // Clears each page f was called for when clear is set.
+    template <typename F>
+    void ForEach(u64 begin, u64 end, bool clear, F&& f) {
+        while (begin < end) {
+            const u64 chunk_end = std::min(end, ((begin >> 12) + 1) << 12);
+            const auto it = chunks.find(begin >> 12);
+            if (it == chunks.end()) {
+                begin = chunk_end;
+                continue;
+            }
+            for (u64 page = begin; page < chunk_end;) {
+                u64& word = it->second[(page >> 6) & 63];
+                const u64 word_end = std::min(chunk_end, (page | 63) + 1);
+                u64 bits = word >> (page & 63);
+                if (word_end - page < 64) {
+                    bits &= (1ULL << (word_end - page)) - 1;
+                }
+                while (bits != 0) {
+                    const u64 hit = page + std::countr_zero(bits);
+                    bits &= bits - 1;
+                    if (clear) {
+                        word &= ~(1ULL << (hit & 63));
+                    }
+                    if (!f(hit)) {
+                        return;
+                    }
+                }
+                page = word_end;
+            }
+            begin = chunk_end;
+        }
+    }
+
+private:
+    std::array<u64, 64>& Chunk(u64 page) {
+        if (page >> 12 != last_id || last == nullptr) {
+            last_id = page >> 12;
+            last = &chunks[last_id];
+        }
+        return *last;
+    }
+    std::unordered_map<u64, std::array<u64, 64>> chunks;
+    u64 last_id{};
+    std::array<u64, 64>* last{};
+};
 
 // Implementation class used to keep the specifics of the memory subsystem hidden
 // from outside classes. This also allows modification to the internals of the memory
@@ -768,7 +829,7 @@ struct Memory::Impl {
             const bool cached = std::as_const(current_page_table->entries)[page].Type() ==
                                 Common::PageType::RasterizerCachedMemory;
             armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
-            if (!cached || !armed_read_traps.insert(page).second) {
+            if (!cached || !armed_read_traps.Set(page)) {
                 armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
                 protect_run();
                 continue;
@@ -786,8 +847,10 @@ struct Memory::Impl {
             return false;
         }
         std::scoped_lock lk{read_trap_mutex};
-        const auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
-        return it != armed_read_traps.end() && *it <= ((vaddr + size - 1) >> YUZU_PAGEBITS);
+        bool armed = false;
+        armed_read_traps.ForEach(vaddr >> YUZU_PAGEBITS, ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1,
+                                 false, [&](u64) { return !(armed = true); });
+        return armed;
     }
 
     /// Takes read permission away again from armed pages that were just cached again.
@@ -797,10 +860,10 @@ struct Memory::Impl {
         }
         std::scoped_lock lk{read_trap_mutex};
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
-        for (auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
-             it != armed_read_traps.end() && *it < page_end; ++it) {
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
-        }
+        armed_read_traps.ForEach(vaddr >> YUZU_PAGEBITS, page_end, false, [&](u64 page) {
+            host_buffer->Protect(page << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
+            return true;
+        });
     }
 
     /// A slow-path read of a cached page: its trap, if any, has done its job.
@@ -810,14 +873,13 @@ struct Memory::Impl {
         }
         std::scoped_lock lk{read_trap_mutex};
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
-        auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
-        while (it != armed_read_traps.end() && *it < page_end) {
+        armed_read_traps.ForEach(vaddr >> YUZU_PAGEBITS, page_end, true, [&](u64 page) {
             // Still cached (this read came through the rasterizer path): writes stay trapped.
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
+            host_buffer->Protect(page << YUZU_PAGEBITS, YUZU_PAGESIZE,
                                  Common::MemoryPermission::Read);
-            it = armed_read_traps.erase(it);
             armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
-        }
+            return true;
+        });
     }
 
     /**
@@ -1188,7 +1250,7 @@ struct Memory::Impl {
     std::array<VideoCore::RasterizerDownloadArea, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_generations{};
     std::atomic<u64> read_trap_generation{};
-    std::set<u64> armed_read_traps;
+    ArmedPages armed_read_traps;
     std::atomic<size_t> armed_read_trap_count{};
     std::mutex read_trap_mutex;
     std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
