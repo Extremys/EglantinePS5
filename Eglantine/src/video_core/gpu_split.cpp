@@ -26,6 +26,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/thread.h"
+#include "core/causal_delay.h"
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -885,8 +886,25 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 BackWatch::progress.fetch_add(1, std::memory_order_relaxed);
                 BackWatch::Step("entry");
             }
+            // EDEN_CAUSAL_BACK_PCT=N: this thread's work N% slower (causal profiling).
+#if defined(__x86_64__)
+            static const long back_pct = Core::Causal::Read("EDEN_CAUSAL_BACK_PCT");
+#else
+            constexpr long back_pct = 0;
+#endif
+#if defined(__x86_64__)
+            const u64 tsc_start = back_pct > 0 ? __builtin_ia32_rdtsc() : 0;
+#endif
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
+#if defined(__x86_64__)
+            if (back_pct > 0) {
+                const u64 now = __builtin_ia32_rdtsc();
+                const u64 end = now + (now - tsc_start) * u64(back_pct) / 100;
+                while (__builtin_ia32_rdtsc() < end) {
+                }
+            }
+#endif
             read_position += size != 0 ? size : RingWords - index;
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
