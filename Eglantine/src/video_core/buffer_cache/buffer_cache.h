@@ -974,7 +974,12 @@ void BufferCache<P>::NoteReadBackWrite(DAddr device_addr, u64 size) {
                 // The guest no longer reads it after its writes.
                 it->reads = 0;
             }
-            if (it->reads >= EarlyAfterReads &&
+            // EDEN_NX2_EARLY_DOWNLOADS=0: no early downloads (reads flush on demand), for A/B runs.
+            static const bool early_downloads = [] {
+                const char* value = std::getenv("EDEN_NX2_EARLY_DOWNLOADS");
+                return value == nullptr || value[0] != '0';
+            }();
+            if (early_downloads && it->reads >= EarlyAfterReads &&
                 std::ranges::find(early_pages, it->page) == early_pages.end()) {
                 early_pages.push_back(it->page);
             }
