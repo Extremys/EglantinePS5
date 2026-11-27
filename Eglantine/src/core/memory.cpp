@@ -77,6 +77,27 @@ public:
         word |= bit;
         return added;
     }
+    // Whether every page in [begin, end) is armed, 64 pages at a time.
+    bool AllSet(u64 begin, u64 end) const {
+        while (begin < end) {
+            const u64 chunk_end = std::min(end, ((begin >> 12) + 1) << 12);
+            const auto it = chunks.find(begin >> 12);
+            if (it == chunks.end()) {
+                return false;
+            }
+            for (u64 page = begin; page < chunk_end;) {
+                const u64 word_end = std::min(chunk_end, (page | 63) + 1);
+                const u64 count = word_end - page;
+                const u64 want = count == 64 ? ~0ULL : ((1ULL << count) - 1);
+                if (((it->second[(page >> 6) & 63] >> (page & 63)) & want) != want) {
+                    return false;
+                }
+                page = word_end;
+            }
+            begin = chunk_end;
+        }
+        return true;
+    }
     // Calls f(page) for each armed page in [begin, end), in order; f returns false to stop.
     // Clears each page f was called for when clear is set.
     template <typename F>
@@ -814,10 +835,18 @@ struct Memory::Impl {
         }
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
         std::scoped_lock lk{read_trap_mutex};
+        // A full clear re-arms its whole render target (thousands of pages) though the traps
+        // are still set: about 25 us per clear in Ocarina of Time's heavy areas. Arming an armed
+        // page does nothing, so a range armed throughout is done.
+        if (armed_read_traps.AllSet(vaddr >> YUZU_PAGEBITS, page_end)) {
+            return;
+        }
         u64 run_begin = 0;
         u64 run_pages = 0;
         const auto protect_run = [&] {
             if (run_pages > 0) {
+                // Counted before the protection, so a page that traps is never seen as unarmed.
+                armed_read_trap_count.fetch_add(run_pages, std::memory_order_relaxed);
                 // Reads that hit a cached read area must not skip the flush of a new trap.
                 read_trap_generation.fetch_add(1, std::memory_order_release);
                 host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
@@ -828,9 +857,7 @@ struct Memory::Impl {
         for (u64 page = vaddr >> YUZU_PAGEBITS; page != page_end; ++page) {
             const bool cached = std::as_const(current_page_table->entries)[page].Type() ==
                                 Common::PageType::RasterizerCachedMemory;
-            armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
             if (!cached || !armed_read_traps.Set(page)) {
-                armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
                 protect_run();
                 continue;
             }
